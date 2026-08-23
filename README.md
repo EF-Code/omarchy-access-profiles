@@ -24,7 +24,11 @@ omarchy bar move io.github.ef-code.access-profiles --section right
 
 Open the Access icon, select a profile, review the plan, and choose **Preview
 30s** or **Apply**. Preview has explicit **Keep** and **Revert now** actions.
-The first preview or apply captures the original baseline exactly once.
+The first preview or apply captures the original value for each setting Access
+actually manages. Later profile switches add only their newly managed settings
+to that baseline. Restore leaves settings Access never changed alone, restores
+safe entries even when another entry has external drift, and keeps conflicts
+pending until you resolve them.
 
 The bar widget can be placed with the standard Omarchy bar command:
 
