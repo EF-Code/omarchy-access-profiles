@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="620" viewBox="0 0 960 620" role="img" aria-labelledby="title desc">
+  <title id="title">Access Profiles panel preview</title>
+  <desc id="desc">A dark Omarchy-style panel showing four accessibility profiles and a reversible change plan.</desc>
+  <rect width="960" height="620" rx="26" fill="#171717"/>
+  <rect x="24" y="24" width="912" height="44" rx="12" fill="#262626"/>
+  <circle cx="62" cy="46" r="9" fill="#d9ff85"/>
+  <text x="84" y="52" fill="#f2f2f2" font-family="sans-serif" font-size="19" font-weight="700">OMARCHY</text>
+  <text x="805" y="52" fill="#d9ff85" font-family="sans-serif" font-size="18">󰌵  Access</text>
+  <rect x="242" y="92" width="476" height="494" rx="18" fill="#222222" stroke="#525252" stroke-width="2"/>
+  <text x="274" y="132" fill="#f2f2f2" font-family="sans-serif" font-size="23" font-weight="700">ACCESS</text>
+  <text x="624" y="132" fill="#d9ff85" font-family="sans-serif" font-size="15">Original</text>
+  <text x="274" y="159" fill="#b6b6b6" font-family="sans-serif" font-size="15">Make the desktop easier to see, follow, and control.</text>
+  <rect x="274" y="180" width="196" height="62" rx="11" fill="#35442b" stroke="#d9ff85" stroke-width="2"/>
+  <rect x="482" y="180" width="196" height="62" rx="11" fill="#2c2c2c" stroke="#565656"/>
+  <text x="290" y="207" fill="#f2f2f2" font-family="sans-serif" font-size="16" font-weight="700">Comfortable</text>
+  <text x="290" y="227" fill="#b6b6b6" font-family="sans-serif" font-size="12">Larger text · less strain</text>
+  <text x="498" y="207" fill="#f2f2f2" font-family="sans-serif" font-size="16" font-weight="700">Reduced Motion</text>
+  <text x="498" y="227" fill="#b6b6b6" font-family="sans-serif" font-size="12">Minimize visual effects</text>
+  <rect x="274" y="258" width="196" height="62" rx="11" fill="#2c2c2c" stroke="#565656"/>
+  <rect x="482" y="258" width="196" height="62" rx="11" fill="#2c2c2c" stroke="#565656"/>
+  <text x="290" y="285" fill="#f2f2f2" font-family="sans-serif" font-size="16" font-weight="700">Presentation</text>
+  <text x="290" y="305" fill="#b6b6b6" font-family="sans-serif" font-size="12">Find pointer and focus</text>
+  <text x="498" y="285" fill="#f2f2f2" font-family="sans-serif" font-size="16" font-weight="700">Focus</text>
+  <text x="498" y="305" fill="#b6b6b6" font-family="sans-serif" font-size="12">Reduce distraction</text>
+  <text x="274" y="356" fill="#f2f2f2" font-family="sans-serif" font-size="18" font-weight="700">Comfortable</text>
+  <text x="274" y="381" fill="#b6b6b6" font-family="sans-serif" font-size="14">Review the exact values before applying.</text>
+  <line x1="274" y1="402" x2="686" y2="402" stroke="#414141"/>
+  <text x="274" y="432" fill="#f2f2f2" font-family="sans-serif" font-size="14">GTK text scale</text>
+  <text x="536" y="432" fill="#d9ff85" font-family="sans-serif" font-size="14">100% → 125%</text>
+  <text x="274" y="460" fill="#f2f2f2" font-family="sans-serif" font-size="14">Cursor size</text>
+  <text x="536" y="460" fill="#d9ff85" font-family="sans-serif" font-size="14">24 → 36 px</text>
+  <text x="274" y="488" fill="#f2f2f2" font-family="sans-serif" font-size="14">Animations</text>
+  <text x="536" y="488" fill="#d9ff85" font-family="sans-serif" font-size="14">On → Reduced</text>
+  <rect x="274" y="516" width="132" height="42" rx="10" fill="#333333" stroke="#777777"/>
+  <rect x="416" y="516" width="96" height="42" rx="10" fill="#d9ff85"/>
+  <text x="294" y="542" fill="#f2f2f2" font-family="sans-serif" font-size="14">Preview 30s</text>
+  <text x="447" y="542" fill="#171717" font-family="sans-serif" font-size="14" font-weight="700">Apply</text>
+  <text x="535" y="542" fill="#b6b6b6" font-family="sans-serif" font-size="13">Restore original</text>
+</svg>

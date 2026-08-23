@@ -9,6 +9,8 @@ Comfortable, Reduced Motion, Presentation, and Focus. Every preview and apply
 is read back, state is kept outside the checkout, and restore detects changes
 made by another tool before touching them.
 
+![Access Profiles panel preview](assets/preview.svg)
+
 ## Install
 
 Plugins run as unsandboxed code inside `omarchy-shell`; inspect this repository
@@ -90,4 +92,3 @@ directory. The mock adapter never changes the live desktop.
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
