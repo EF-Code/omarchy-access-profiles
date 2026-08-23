@@ -36,3 +36,30 @@ teardown() { rm -rf "$TEST_ROOT"; }
   [ "$status" -ne 0 ]
   [ "$(jq -r '.details.conflicts[0].id' <<< "$output")" = "hypr.border_size" ]
 }
+
+@test "restore leaves an unmanaged baseline value untouched" {
+  run scripts/accessctl apply comfortable --operation-id 33333333-3333-4333-8333-333333333333
+  [ "$status" -eq 0 ]
+  jq '.values."hypr.blur.enabled" = true' "$TEST_ROOT/state/omarchy-access-profiles/baseline.json" > "$TEST_ROOT/state/omarchy-access-profiles/baseline-with-unmanaged"
+  mv "$TEST_ROOT/state/omarchy-access-profiles/baseline-with-unmanaged" "$TEST_ROOT/state/omarchy-access-profiles/baseline.json"
+  jq '."hypr.blur.enabled" = false' "$TEST_ROOT/mock/values.json" > "$TEST_ROOT/mock/changed"
+  mv "$TEST_ROOT/mock/changed" "$TEST_ROOT/mock/values.json"
+  run scripts/accessctl restore --operation-id 44444444-4444-4444-8444-444444444444
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '."hypr.blur.enabled"' "$TEST_ROOT/mock/values.json")" = false ]
+}
+
+@test "restore applies safe values before requiring conflict resolution" {
+  run scripts/accessctl apply comfortable --operation-id 55555555-5555-4555-8555-555555555555
+  [ "$status" -eq 0 ]
+  jq '."hypr.border_size" = 9' "$TEST_ROOT/mock/values.json" > "$TEST_ROOT/mock/changed"
+  mv "$TEST_ROOT/mock/changed" "$TEST_ROOT/mock/values.json"
+  run scripts/accessctl restore --operation-id 66666666-6666-4666-8666-666666666666
+  [ "$status" -ne 0 ]
+  [ "$(jq -r '."gtk.text.scale"' "$TEST_ROOT/mock/values.json")" = 1.0 ]
+  [ -e "$TEST_ROOT/state/omarchy-access-profiles/baseline.json" ]
+  run scripts/accessctl resolve-conflict hypr.border_size --keep-external
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '."hypr.border_size"' "$TEST_ROOT/mock/values.json")" = 9 ]
+  [ ! -e "$TEST_ROOT/state/omarchy-access-profiles/baseline.json" ]
+}

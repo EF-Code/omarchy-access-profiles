@@ -122,6 +122,46 @@ test_conflict_resolution() {
   cleanup_env
 }
 
+test_restore_does_not_overwrite_unmanaged_baseline_value() {
+  new_env
+  call apply comfortable --operation-id 67676767-6767-4676-8676-676767676767
+  jq '.values."hypr.blur.enabled" = true' "$TEST_ROOT/state/omarchy-access-profiles/baseline.json" > "$TEST_ROOT/state/omarchy-access-profiles/baseline-with-unmanaged"
+  mv "$TEST_ROOT/state/omarchy-access-profiles/baseline-with-unmanaged" "$TEST_ROOT/state/omarchy-access-profiles/baseline.json"
+  jq '."hypr.blur.enabled" = false' "$TEST_ROOT/mock/values.json" > "$TEST_ROOT/mock/changed"
+  mv "$TEST_ROOT/mock/changed" "$TEST_ROOT/mock/values.json"
+  call restore --operation-id 68686868-6868-4686-8686-686868686868
+  local ok=$([ "$STATUS" -eq 0 ] && [ "$(jq -r '."hypr.blur.enabled"' "$TEST_ROOT/mock/values.json")" = false ] && [ ! -e "$TEST_ROOT/state/omarchy-access-profiles/baseline.json" ] && echo yes || echo no)
+  if [[ "$ok" == yes ]]; then record_pass "restore leaves unmanaged baseline values untouched"; else record_fail "restore leaves unmanaged baseline values untouched"; fi
+  cleanup_env
+}
+
+test_restore_applies_safe_values_before_conflict_resolution() {
+  new_env
+  call apply comfortable --operation-id 69696969-6969-4696-8696-696969696969
+  jq '."hypr.border_size" = 9' "$TEST_ROOT/mock/values.json" > "$TEST_ROOT/mock/changed"
+  mv "$TEST_ROOT/mock/changed" "$TEST_ROOT/mock/values.json"
+  call restore --operation-id 70707070-7070-4707-8707-707070707070
+  local ok=$([ "$STATUS" -ne 0 ] && [ "$(jq -r '."gtk.text.scale"' "$TEST_ROOT/mock/values.json")" = 1.0 ] && [ -e "$TEST_ROOT/state/omarchy-access-profiles/baseline.json" ] && jq -e '.conflicts | length == 1' "$TEST_ROOT/state/omarchy-access-profiles/state.json" >/dev/null 2>&1 && echo yes || echo no)
+  call resolve-conflict hypr.border_size --keep-external
+  ok=$([[ "$ok" == yes && "$STATUS" -eq 0 ]] && [ "$(jq -r '."hypr.border_size"' "$TEST_ROOT/mock/values.json")" = 9 ] && [ "$(jq -r '."gtk.text.scale"' "$TEST_ROOT/mock/values.json")" = 1.0 ] && [ ! -e "$TEST_ROOT/state/omarchy-access-profiles/baseline.json" ] && echo yes || echo no)
+  if [[ "$ok" == yes ]]; then record_pass "safe restore continues while external conflict is pending"; else record_fail "safe restore continues while external conflict is pending"; fi
+  cleanup_env
+}
+
+test_restore_tracks_managed_values_across_profile_switches() {
+  new_env
+  call apply comfortable --operation-id 71717171-7171-4717-8717-717171717171
+  call apply focus --operation-id 72727272-7272-4727-8727-727272727272
+  jq '."gtk.text.scale" = 1.5' "$TEST_ROOT/mock/values.json" > "$TEST_ROOT/mock/changed"
+  mv "$TEST_ROOT/mock/changed" "$TEST_ROOT/mock/values.json"
+  call restore --operation-id 73737373-7373-4737-8737-737373737373
+  local ok=$([ "$STATUS" -ne 0 ] && [ "$(jq -r '."gtk.text.scale"' "$TEST_ROOT/mock/values.json")" = 1.5 ] && [ "$(jq -r '.details.conflicts[0].id' <<< "$OUTPUT")" = "gtk.text.scale" ] && echo yes || echo no)
+  call resolve-conflict gtk.text.scale --keep-external
+  ok=$([[ "$ok" == yes && "$STATUS" -eq 0 ]] && [ "$(jq -r '."gtk.text.scale"' "$TEST_ROOT/mock/values.json")" = 1.5 ] && [ ! -e "$TEST_ROOT/state/omarchy-access-profiles/baseline.json" ] && echo yes || echo no)
+  if [[ "$ok" == yes ]]; then record_pass "restore tracks settings managed by earlier profiles"; else record_fail "restore tracks settings managed by earlier profiles"; fi
+  cleanup_env
+}
+
 test_idempotency_and_diagnostics() {
   new_env
   call apply comfortable --operation-id 77777777-7777-4777-8777-777777777777
@@ -174,6 +214,9 @@ test_rollback
 test_preview_recovery
 test_status_recovers_expired_preview
 test_conflict_resolution
+test_restore_does_not_overwrite_unmanaged_baseline_value
+test_restore_applies_safe_values_before_conflict_resolution
+test_restore_tracks_managed_values_across_profile_switches
 test_idempotency_and_diagnostics
 test_profile_validation
 test_invalid_and_symlink_state
