@@ -39,7 +39,7 @@ Do not describe the plugin as submitted until the external issue/form exists.
 
 ## Evidence from 2026-08-23
 
-- Public install tested from `https://github.com/EF-Code/omarchy-access-profiles.git`; the final tested public revision is `d69f3310f70faa5dc583ac46ac49eebf7a3c4d7a`.
+- Public install tested from `https://github.com/EF-Code/omarchy-access-profiles.git` at `d69f3310f70faa5dc583ac46ac49eebf7a3c4d7a`; the subsequent public revisions are documentation-only.
 - Live session: Omarchy 4.0.0, Hyprland 0.56.2, Quickshell 0.3.0, Wayland, one 1920x1080 display at scale 1.25.
 - Reversible headless-output test created and removed `HEADLESS-1`; no persistent monitor change remained.
 - Pointer click/click-away and visual two-physical-monitor behavior are the remaining graphical-session gaps.
