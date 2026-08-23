@@ -35,5 +35,8 @@ assert.equal(model.formatCountdown(130, 0), "2:10")
 assert.equal(model.hasActionableChanges(plan), true)
 assert.equal(model.barState({ activeProfile: "focus", preview: null, conflicts: [] }).key, "active")
 assert.equal(model.barState({ activeProfile: null, preview: null, conflicts: [{ id: "x" }] }).warning, true)
+assert.equal(model.parseResponse("[]").ok, false)
+assert.equal(model.profilesFromResponse({ profiles: [{ id: "bad", name: "Bad", settings: [] }] }).length, 0)
+assert.equal(model.backendErrorMessage("preview-active"), "Keep or revert the active preview before continuing.")
 
 console.log("model tests passed")

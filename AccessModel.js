@@ -18,7 +18,7 @@ var settingLabels = {
 function parseResponse(raw) {
   try {
     var value = JSON.parse(String(raw || ""))
-    return value && typeof value === "object" ? value : { ok: false, error: "Invalid backend response" }
+    return value && typeof value === "object" && !Array.isArray(value) ? value : { ok: false, error: "Invalid backend response" }
   } catch (error) {
     return { ok: false, error: "Invalid backend response" }
   }
@@ -29,7 +29,7 @@ function profilesFromResponse(raw) {
   if (!response || !Array.isArray(response.profiles)) return []
   return response.profiles.filter(function(profile) {
     return profile && typeof profile.id === "string" && typeof profile.name === "string"
-      && profile.settings && typeof profile.settings === "object"
+      && profile.settings && typeof profile.settings === "object" && !Array.isArray(profile.settings)
   })
 }
 
@@ -114,6 +114,17 @@ function hasActionableChanges(plan) {
   return false
 }
 
+function backendErrorMessage(error) {
+  switch (String(error || "")) {
+  case "external-drift": return "Some managed settings changed outside Access. Resolve each choice below."
+  case "external-drift-pending": return "Resolve the pending external changes before applying another profile."
+  case "external-drift-changed": return "That setting changed again. Review its latest value before choosing again."
+  case "preview-active": return "Keep or revert the active preview before continuing."
+  case "operation-id-reused": return "That operation ID was already used for a different request. Try again."
+  default: return String(error || "Access backend failed")
+  }
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     parseResponse: parseResponse,
@@ -126,6 +137,7 @@ if (typeof module !== "undefined") {
     warningSummary: warningSummary,
     formatCountdown: formatCountdown,
     barState: barState,
-    hasActionableChanges: hasActionableChanges
+    hasActionableChanges: hasActionableChanges,
+    backendErrorMessage: backendErrorMessage
   }
 }
