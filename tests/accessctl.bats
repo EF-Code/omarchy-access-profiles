@@ -27,6 +27,13 @@ teardown() { rm -rf "$TEST_ROOT"; }
   [ ! -e "$TEST_ROOT/state/omarchy-access-profiles/pending.json" ]
 }
 
+@test "failed apply does not leave a new baseline" {
+  export ACCESSCTL_MOCK_FAIL_AFTER=1
+  run scripts/accessctl apply comfortable --operation-id 77777777-7777-4777-8777-777777777777
+  [ "$status" -ne 0 ]
+  [ ! -e "$TEST_ROOT/state/omarchy-access-profiles/baseline.json" ]
+}
+
 @test "restore reports external drift instead of overwriting it" {
   run scripts/accessctl apply comfortable --operation-id 11111111-1111-4111-8111-111111111111
   [ "$status" -eq 0 ]

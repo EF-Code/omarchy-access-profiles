@@ -88,6 +88,15 @@ test_rollback() {
   cleanup_env
 }
 
+test_failed_apply_does_not_leave_a_new_baseline() {
+  new_env
+  export ACCESSCTL_MOCK_FAIL_AFTER=1
+  call apply comfortable --operation-id 34343434-3434-4343-8343-343434343434
+  local ok=$([ "$STATUS" -ne 0 ] && [ ! -e "$TEST_ROOT/state/omarchy-access-profiles/baseline.json" ] && echo yes || echo no)
+  if [[ "$ok" == yes ]]; then record_pass "failed apply removes its uncommitted baseline"; else record_fail "failed apply removes its uncommitted baseline"; fi
+  cleanup_env
+}
+
 test_preview_recovery() {
   new_env
   call preview reduced-motion --seconds 30 --operation-id 44444444-4444-4444-8444-444444444444
@@ -211,6 +220,7 @@ test_capabilities_and_unsupported
 test_apply_restore
 test_baseline_covers_profile_switches
 test_rollback
+test_failed_apply_does_not_leave_a_new_baseline
 test_preview_recovery
 test_status_recovers_expired_preview
 test_conflict_resolution
