@@ -90,6 +90,9 @@ bash tests/repository-check.sh
 For a safe backend-only run, set `ACCESSCTL_MOCK_DIR` to an absolute temporary
 directory. The mock adapter never changes the live desktop.
 
+Use [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) to separate local checks from
+real graphical-session and external-submission gates.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
