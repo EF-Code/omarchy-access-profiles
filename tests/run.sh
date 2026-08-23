@@ -97,6 +97,27 @@ test_conflict_resolution() {
   cleanup_env
 }
 
+test_idempotency_and_diagnostics() {
+  new_env
+  call apply comfortable --operation-id 77777777-7777-4777-8777-777777777777
+  call apply comfortable --operation-id 77777777-7777-4777-8777-777777777777
+  local ok=$([ "$STATUS" -eq 0 ] && jq -e '.idempotent == true' <<< "$OUTPUT" >/dev/null 2>&1 && echo yes || echo no)
+  call export-diagnostics
+  ok=$([[ "$ok" == yes && "$STATUS" -eq 0 ]] && jq -e '.ok and (.notes | length == 1)' <<< "$OUTPUT" >/dev/null 2>&1 && echo yes || echo no)
+  if [[ "$ok" == yes ]]; then record_pass "operation idempotency and redacted diagnostics"; else record_fail "operation idempotency and redacted diagnostics"; fi
+  cleanup_env
+}
+
+test_profile_validation() {
+  new_env
+  mkdir -p "$TEST_ROOT/config/omarchy-access-profiles"
+  jq -n '{schemaVersion:1,profiles:[{id:"bad",name:"Bad",description:"",settings:{"not-registered":true}}]}' > "$TEST_ROOT/config/omarchy-access-profiles/profiles.json"
+  call list-profiles
+  local ok=$([ "$STATUS" -ne 0 ] && jq -e '.error == "profile data is invalid"' <<< "$OUTPUT" >/dev/null 2>&1 && echo yes || echo no)
+  if [[ "$ok" == yes ]]; then record_pass "user profile schema validation"; else record_fail "user profile schema validation"; fi
+  cleanup_env
+}
+
 test_invalid_and_symlink_state() {
   new_env
   call plan 'comfortable;touch /tmp/accessctl-should-not-exist'
@@ -126,6 +147,8 @@ test_apply_restore
 test_rollback
 test_preview_recovery
 test_conflict_resolution
+test_idempotency_and_diagnostics
+test_profile_validation
 test_invalid_and_symlink_state
 test_malformed_state
 
