@@ -25,9 +25,9 @@ qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" \
   BarWidget.qml Panel.qml Service.qml components/*.qml
 bash tests/run.sh
 node tests/model.test.js
+bash tests/repository-check.sh
 ```
 
 If Python is introduced for tests or tooling, invoke `/home/hiro/.venv/bin/python`
 on the development machine. Do not put that developer-specific path in the
 plugin itself.
-

@@ -84,6 +84,7 @@ qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" \
   BarWidget.qml Panel.qml Service.qml components/*.qml
 bash tests/run.sh
 node tests/model.test.js
+bash tests/repository-check.sh
 ```
 
 For a safe backend-only run, set `ACCESSCTL_MOCK_DIR` to an absolute temporary
