@@ -26,12 +26,14 @@ Panel {
   property int nowMs: Date.now()
   property string pendingAction: ""
   property string lastOperationId: ""
+  property string queuedProfileId: ""
   readonly property string backendPath: decodeURIComponent(String(Qt.resolvedUrl("scripts/accessctl")).replace(/^file:\/\//, ""))
   readonly property var selectedProfile: profiles.length > 0 && selectedIndex >= 0 && selectedIndex < profiles.length ? profiles[selectedIndex] : null
   readonly property bool hasActionablePlan: Model.hasActionableChanges(selectedPlan)
   readonly property bool hasBaseline: backendStatus.baselineCaptured === true
-  readonly property string barGlyph: backendStatus.preview ? "󰌵" : "󰌵"
-  readonly property bool barActive: !!backendStatus.activeProfile || !!backendStatus.preview
+  readonly property bool hasPendingConflicts: backendStatus.conflicts && backendStatus.conflicts.length > 0
+  readonly property string barGlyph: "󰌵"
+  readonly property bool barActive: !!backendStatus.activeProfile || !!backendStatus.preview || hasPendingConflicts
   readonly property string barTooltip: Model.barState(backendStatus).label
 
   function operationId() {
@@ -59,14 +61,30 @@ Panel {
   function selectProfile(index) {
     if (index < 0 || index >= profiles.length) return
     selectedIndex = index
+    selectedPlan = null
     if (selectedProfile) runBackend(["plan", String(selectedProfile.id)], "plan")
   }
 
   function applyProfile(profileId) {
+    var requested = String(profileId || "")
+    if (profiles.length === 0) {
+      queuedProfileId = requested
+      load()
+      return
+    }
+    if (loading || backendStatus.preview || hasPendingConflicts) {
+      statusMessage = backendStatus.preview ? "Keep or revert the active preview before continuing."
+        : (hasPendingConflicts ? "Resolve the pending external changes before applying another profile." : "Access is busy. Try again in a moment.")
+      statusWarning = true
+      return
+    }
     for (var i = 0; i < profiles.length; i++) {
-      if (String(profiles[i].id) !== String(profileId)) continue
+      if (String(profiles[i].id) !== requested) continue
       selectedIndex = i
-      applySelected()
+      selectedPlan = null
+      var id = operationId()
+      lastOperationId = id
+      runBackend(["apply", requested, "--operation-id", id], "apply")
       return
     }
     statusMessage = "Unknown profile"
@@ -78,14 +96,14 @@ Panel {
   }
 
   function previewSelected() {
-    if (!selectedProfile || !hasActionablePlan) return
+    if (!selectedProfile || !hasActionablePlan || loading || backendStatus.preview || hasPendingConflicts) return
     var id = operationId()
     lastOperationId = id
     runBackend(["preview", String(selectedProfile.id), "--seconds", "30", "--operation-id", id], "preview")
   }
 
   function applySelected() {
-    if (!selectedProfile || !hasActionablePlan) return
+    if (!selectedProfile || !hasActionablePlan || loading || backendStatus.preview || hasPendingConflicts) return
     var id = operationId()
     lastOperationId = id
     runBackend(["apply", String(selectedProfile.id), "--operation-id", id], "apply")
@@ -110,6 +128,16 @@ Panel {
       statusWarning = false
       return
     }
+    if (backendStatus.preview) {
+      statusMessage = "Keep or revert the active preview before restoring."
+      statusWarning = true
+      return
+    }
+    if (hasPendingConflicts) {
+      statusMessage = "Resolve each pending external change below."
+      statusWarning = true
+      return
+    }
     confirmRestore = true
   }
 
@@ -120,14 +148,19 @@ Panel {
     runBackend(["restore", "--operation-id", id], "restore")
   }
 
+  function resolveConflict(settingId, keepExternal) {
+    if (loading || !hasPendingConflicts) return
+    runBackend(["resolve-conflict", String(settingId), keepExternal ? "--keep-external" : "--restore-baseline"], "resolve-conflict")
+  }
+
   function handleResponse(action, response, exitCode) {
     loading = false
     if (!response || response.ok !== true) {
-      statusMessage = String(response && response.error ? response.error : "Access backend failed")
+      statusMessage = Model.backendErrorMessage(response && response.error ? response.error : "Access backend failed")
       statusWarning = true
       if (response && response.details && Array.isArray(response.details.conflicts))
         backendStatus.conflicts = response.details.conflicts
-      if (action === "restore") refresh()
+      if (action === "restore" || action === "resolve-conflict") refresh()
       return
     }
 
@@ -135,7 +168,11 @@ Panel {
     if (action === "profiles") {
       profiles = Model.profilesFromResponse(response)
       if (selectedIndex >= profiles.length) selectedIndex = Math.max(0, profiles.length - 1)
-      planSelected()
+      if (queuedProfileId !== "") {
+        var requestedProfile = queuedProfileId
+        queuedProfileId = ""
+        Qt.callLater(function() { root.applyProfile(requestedProfile) })
+      } else planSelected()
       return
     }
     if (action === "status") {
@@ -146,7 +183,8 @@ Panel {
       return
     }
     if (action === "plan") {
-      selectedPlan = response
+      if (selectedProfile && String(response.profileId || "") === String(selectedProfile.id)) selectedPlan = response
+      else planSelected()
       return
     }
     if (action === "recover") {
@@ -154,8 +192,13 @@ Panel {
       return
     }
 
-    statusMessage = action === "preview" ? "Preview active — keep it or revert now." : "Access settings updated."
-    refresh()
+    statusMessage = response.preservedExternal && response.preservedExternal.length > 0
+      ? "Preview closed; changes made by another tool were preserved."
+      : (action === "preview" ? "Preview active — keep it or revert now."
+        : (action === "resolve-conflict" ? "External change resolved." : "Access settings updated."))
+    if (hostWidget && typeof hostWidget.broadcast === "function")
+      Qt.callLater(function() { hostWidget.broadcast("refresh") })
+    else refresh()
   }
 
   onOpenedChanged: {
@@ -262,8 +305,9 @@ Panel {
 
           StatusBanner {
             Layout.fillWidth: true
-            message: root.statusMessage || (root.backendStatus.preview ? "Previewing " + root.backendStatus.preview.profileId + " — " + Model.formatCountdown(root.backendStatus.preview.deadline, root.nowMs) + " remaining." : "")
-            warning: root.statusWarning || (root.backendStatus.conflicts && root.backendStatus.conflicts.length > 0)
+            message: root.statusMessage || (root.backendStatus.preview ? "Previewing " + root.backendStatus.preview.profileId + " — " + Model.formatCountdown(root.backendStatus.preview.deadline, root.nowMs) + " remaining."
+              : (root.hasPendingConflicts ? "Some managed settings changed outside Access. Choose what to keep for each setting." : ""))
+            warning: root.statusWarning || root.hasPendingConflicts
             foreground: root.barForeground
           }
 
@@ -315,20 +359,39 @@ Panel {
             }
           }
 
+          ColumnLayout {
+            Layout.fillWidth: true
+            spacing: Style.space(8)
+            visible: root.hasPendingConflicts
+
+            Repeater {
+              model: root.backendStatus.conflicts || []
+              ConflictRow {
+                required property var modelData
+                conflict: modelData
+                foreground: root.barForeground
+                enabled: !root.loading
+                Layout.fillWidth: true
+                onKeepExternal: root.resolveConflict(String(modelData.id), true)
+                onRestoreBaseline: root.resolveConflict(String(modelData.id), false)
+              }
+            }
+          }
+
           RowLayout {
             Layout.fillWidth: true
             spacing: Style.space(8)
             Button {
               Layout.fillWidth: true
               text: "Preview 30s"
-              enabled: root.hasActionablePlan && !root.loading && !root.backendStatus.preview
+              enabled: root.hasActionablePlan && !root.loading && !root.backendStatus.preview && !root.hasPendingConflicts
               focusable: true
               onClicked: root.previewSelected()
             }
             Button {
               Layout.fillWidth: true
               text: "Apply"
-              enabled: root.hasActionablePlan && !root.loading && !root.backendStatus.preview
+              enabled: root.hasActionablePlan && !root.loading && !root.backendStatus.preview && !root.hasPendingConflicts
               focusable: true
               onClicked: root.applySelected()
             }
@@ -356,7 +419,7 @@ Panel {
           Button {
             Layout.fillWidth: true
             text: "Restore original settings"
-            enabled: root.hasBaseline && !root.loading
+            enabled: root.hasBaseline && !root.loading && !root.backendStatus.preview && !root.hasPendingConflicts
             focusable: true
             onClicked: root.requestRestore()
           }
