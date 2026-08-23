@@ -282,11 +282,22 @@ read_setting() {
 format_value() {
   local id="$1" value="$2" type
   type=$(setting_type "$id")
-  if [[ "$type" == bool ]]; then jq -r 'if . then "On" else "Off" end' <<< "$value"; else jq -r -c '.' <<< "$value"; fi
+  if [[ "$type" == bool ]]; then jq -r 'if . then "true" else "false" end' <<< "$value"; else jq -r -c '.' <<< "$value"; fi
+}
+
+hypr_lua_expression() {
+  local option="$1" rendered="$2" expression="$2" i
+  local -a parts
+  [[ "$option" =~ ^[a-z_]+(:[a-z_]+)+$ ]] || return 1
+  IFS=: read -r -a parts <<< "$option"
+  for ((i=${#parts[@]} - 1; i >= 0; i--)); do
+    expression="{ ${parts[$i]} = $expression }"
+  done
+  printf 'hl.config(%s)\n' "$expression"
 }
 
 apply_setting() {
-  local id="$1" value="$2" adapter schema key option rendered
+  local id="$1" value="$2" adapter schema key option rendered response expression
   validate_value "$id" "$value" || { APPLY_ERROR="value rejected"; return 1; }
   if mock_enabled; then
     local count=$((MOCK_APPLY_COUNT + 1))
@@ -308,7 +319,13 @@ apply_setting() {
   rendered=$(format_value "$id" "$value")
   if [[ "$adapter" == hyprctl ]]; then
     option=$(jq -r --arg id "$id" '.[$id].option' <<< "$SETTING_SPECS")
-    "$HYPRCTL_BIN" keyword "$option" "$rendered" >/dev/null 2>&1 || { APPLY_ERROR="hyprctl rejected the setting"; return 1; }
+    if expression=$(hypr_lua_expression "$option" "$rendered") \
+      && response=$("$HYPRCTL_BIN" eval "$expression" 2>/dev/null) \
+      && [[ "$(printf '%s' "$response" | tr -d '\r\n')" == "ok" ]]; then
+      return 0
+    fi
+    response=$("$HYPRCTL_BIN" keyword "$option" "$rendered" 2>/dev/null) || { APPLY_ERROR="hyprctl rejected the setting"; return 1; }
+    [[ "$(printf '%s' "$response" | tr -d '\r\n')" == "ok" ]] || { APPLY_ERROR="hyprctl rejected the setting"; return 1; }
   else
     schema=$(jq -r --arg id "$id" '.[$id].schema' <<< "$SETTING_SPECS")
     key=$(jq -r --arg id "$id" '.[$id].key' <<< "$SETTING_SPECS")
