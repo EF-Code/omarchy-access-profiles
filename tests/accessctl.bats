@@ -70,3 +70,38 @@ teardown() { rm -rf "$TEST_ROOT"; }
   [ "$(jq -r '."hypr.border_size"' "$TEST_ROOT/mock/values.json")" = 9 ]
   [ ! -e "$TEST_ROOT/state/omarchy-access-profiles/baseline.json" ]
 }
+
+@test "recovery rolls back only settings listed as applied" {
+  mkdir -p "$TEST_ROOT/state/omarchy-access-profiles"
+  jq '."hypr.border_size" = 3 | ."gtk.text.scale" = 1.6' "$TEST_ROOT/mock/values.json" > "$TEST_ROOT/mock/changed"
+  mv "$TEST_ROOT/mock/changed" "$TEST_ROOT/mock/values.json"
+  jq -n '{schemaVersion:1,operationId:"77777777-7777-4777-8777-777777777777",kind:"apply",profileId:"comfortable",before:{"hypr.border_size":2,"gtk.text.scale":1.0},target:{"hypr.border_size":3,"gtk.text.scale":1.25},applied:["hypr.border_size"],phase:"applying",baselineChanged:false,baselinePrevious:null}' > "$TEST_ROOT/state/omarchy-access-profiles/pending.json"
+  run scripts/accessctl recover
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '."hypr.border_size"' "$TEST_ROOT/mock/values.json")" = 2 ]
+  [ "$(jq -r '."gtk.text.scale"' "$TEST_ROOT/mock/values.json")" = 1.6 ]
+}
+
+@test "preview revert preserves a concurrent external change" {
+  run scripts/accessctl preview comfortable --seconds 30 --operation-id 88888888-8888-4888-8888-888888888888
+  [ "$status" -eq 0 ]
+  jq '."hypr.border_size" = 9' "$TEST_ROOT/mock/values.json" > "$TEST_ROOT/mock/changed"
+  mv "$TEST_ROOT/mock/changed" "$TEST_ROOT/mock/values.json"
+  run scripts/accessctl cancel-preview --operation-id 88888888-8888-4888-8888-888888888888
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '.preservedExternal[0]' <<< "$output")" = "hypr.border_size" ]
+  [ "$(jq -r '."hypr.border_size"' "$TEST_ROOT/mock/values.json")" = 9 ]
+  [ "$(jq -r '."gtk.text.scale"' "$TEST_ROOT/mock/values.json")" = 1.0 ]
+}
+
+@test "apply is rejected while restore conflicts are pending" {
+  run scripts/accessctl apply comfortable --operation-id 99999999-9999-4999-8999-999999999999
+  [ "$status" -eq 0 ]
+  jq '."hypr.border_size" = 9' "$TEST_ROOT/mock/values.json" > "$TEST_ROOT/mock/changed"
+  mv "$TEST_ROOT/mock/changed" "$TEST_ROOT/mock/values.json"
+  run scripts/accessctl restore --operation-id aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+  [ "$status" -ne 0 ]
+  run scripts/accessctl apply focus --operation-id bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+  [ "$status" -ne 0 ]
+  [ "$(jq -r '.error' <<< "$output")" = "external-drift-pending" ]
+}
