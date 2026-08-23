@@ -169,7 +169,7 @@ Panel {
     id: backendProcess
     stdout: StdioCollector { id: backendStdout; waitForEnd: true }
     stderr: StdioCollector { id: backendStderr; waitForEnd: true }
-    onExited: {
+    onExited: function(exitCode) {
       var output = String(backendStdout.text || "").trim()
       var response = Model.parseResponse(output)
       if (exitCode !== 0 && response.ok === true) response = { ok: false, error: String(backendStderr.text || "Backend failed") }
