@@ -12,6 +12,8 @@ readonly SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 readonly DEFAULT_PROFILES_FILE="$SCRIPT_DIR/../profiles/defaults.json"
 readonly SETTING_SPECS='{"gtk.animations.enabled":{"type":"bool","scope":"GTK applications","label":"GTK animations","adapter":"gsettings","schema":"org.gnome.desktop.interface","key":"enable-animations"},"gtk.cursor.size":{"type":"int","min":16,"max":128,"scope":"GTK applications","label":"GTK cursor size","adapter":"gsettings","schema":"org.gnome.desktop.interface","key":"cursor-size"},"gtk.text.scale":{"type":"number","min":0.5,"max":3,"scope":"GTK applications","label":"GTK text scale","adapter":"gsettings","schema":"org.gnome.desktop.interface","key":"text-scaling-factor"},"hypr.animations.enabled":{"type":"bool","scope":"Hyprland session","label":"Hyprland animations","adapter":"hyprctl","option":"animations:enabled"},"hypr.blur.enabled":{"type":"bool","scope":"Hyprland session","label":"Blur","adapter":"hyprctl","option":"decoration:blur:enabled"},"hypr.border_size":{"type":"int","min":0,"max":32,"scope":"Hyprland session","label":"Window border size","adapter":"hyprctl","option":"general:border_size"},"hypr.cursor.zoom_factor":{"type":"number","min":0.5,"max":3,"scope":"Hyprland compositor","label":"Cursor zoom","adapter":"hyprctl","option":"cursor:zoom_factor"},"hypr.dim_inactive":{"type":"bool","scope":"Hyprland session","label":"Inactive-window dimming","adapter":"hyprctl","option":"decoration:dim_inactive"},"hypr.dim_strength":{"type":"number","min":0,"max":1,"scope":"Hyprland session","label":"Inactive dim strength","adapter":"hyprctl","option":"decoration:dim_strength"},"hypr.shadow.enabled":{"type":"bool","scope":"Hyprland session","label":"Window shadows","adapter":"hyprctl","option":"decoration:shadow:enabled"},"input.repeat_delay":{"type":"int","min":100,"max":2000,"scope":"Hyprland keyboard input","label":"Keyboard repeat delay","adapter":"hyprctl","option":"input:repeat_delay"},"input.repeat_rate":{"type":"int","min":1,"max":100,"scope":"Hyprland keyboard input","label":"Keyboard repeat rate","adapter":"hyprctl","option":"input:repeat_rate"}}'
 MOCK_APPLY_COUNT=0
+BASELINE_PREVIOUS_JSON='null'
+BASELINE_CAPTURE_CHANGED=false
 
 die() {
   printf 'accessctl: %s\n' "$*" >&2
@@ -386,6 +388,8 @@ capture_baseline() {
   local -a ids=()
   [[ -n "$source" ]] || { die "baseline source is required"; return 1; }
   jq -e 'type == "object"' <<< "$source" >/dev/null 2>&1 || { die "baseline source is malformed"; return 1; }
+  BASELINE_PREVIOUS_JSON="$BASELINE_JSON"
+  BASELINE_CAPTURE_CHANGED=false
   if [[ "$BASELINE_JSON" == null ]]; then
     values='{}'
     BASELINE_JSON=$(jq -cn --arg version "$(hyprland_version)" \
@@ -400,7 +404,27 @@ capture_baseline() {
     values=$(jq -c --arg id "$id" --argjson value "$value" '.[$id] = $value' <<< "$values")
   done
   BASELINE_JSON=$(jq -c --argjson values "$values" '.values=$values' <<< "$BASELINE_JSON")
-  atomic_write "$BASELINE_FILE" "$BASELINE_JSON"
+  if [[ "$BASELINE_JSON" != "$BASELINE_PREVIOUS_JSON" ]]; then
+    atomic_write "$BASELINE_FILE" "$BASELINE_JSON" || return 1
+    BASELINE_CAPTURE_CHANGED=true
+  fi
+}
+
+rollback_baseline_capture() {
+  [[ "$BASELINE_CAPTURE_CHANGED" == true ]] || return 0
+  if [[ "$BASELINE_PREVIOUS_JSON" == null ]]; then
+    remove_safe_file "$BASELINE_FILE" || return 1
+    BASELINE_JSON=null
+  else
+    atomic_write "$BASELINE_FILE" "$BASELINE_PREVIOUS_JSON" || return 1
+    BASELINE_JSON="$BASELINE_PREVIOUS_JSON"
+  fi
+  BASELINE_CAPTURE_CHANGED=false
+}
+
+commit_baseline_capture() {
+  BASELINE_PREVIOUS_JSON='null'
+  BASELINE_CAPTURE_CHANGED=false
 }
 
 requested_ids() { jq -r '.settings | keys[]' <<< "$1"; }
@@ -590,7 +614,12 @@ cmd_apply() {
   before=$(snapshot_for_profile "$profile") || { json_error "could not read current values" 2 "$(jq -cn --arg reason "${SNAPSHOT_ERROR:-$READ_ERROR}" '{reason:$reason}')"; return; }
   target=$(target_for_profile "$profile" "$before")
   capture_baseline "$before" || { json_error "could not capture baseline" 2; return; }
-  apply_snapshot_transaction "$before" "$target" "$operation" apply "$profile_id" || { json_error "${TX_ERROR:-apply failed}" 2; return; }
+  if ! apply_snapshot_transaction "$before" "$target" "$operation" apply "$profile_id"; then
+    rollback_baseline_capture || true
+    json_error "${TX_ERROR:-apply failed}" 2
+    return
+  fi
+  commit_baseline_capture
   STATE_JSON=$(jq -c --arg profile "$profile_id" --arg op "$operation" --argjson applied "$TX_APPLIED" \
     --argjson target "$target" '.activeProfile=$profile | .lastApplied = ((.lastApplied // {}) + $target) | .preview=null | .conflicts=[] | .lastOperationId=$op' <<< "$STATE_JSON")
   save_state || { json_error "settings applied but state persistence failed" 2; return; }
@@ -609,7 +638,12 @@ cmd_preview() {
   target=$(target_for_profile "$profile" "$before")
   capture_baseline "$before" || { json_error "could not capture baseline" 2; return; }
   deadline=$(( $(date +%s) + seconds ))
-  apply_snapshot_transaction "$before" "$target" "$operation" preview "$profile_id" || { json_error "${TX_ERROR:-preview failed}" 2; return; }
+  if ! apply_snapshot_transaction "$before" "$target" "$operation" preview "$profile_id"; then
+    rollback_baseline_capture || true
+    json_error "${TX_ERROR:-preview failed}" 2
+    return
+  fi
+  commit_baseline_capture
   STATE_JSON=$(jq -c --arg profile "$profile_id" --arg op "$operation" --argjson before "$before" --argjson target "$target" --argjson deadline "$deadline" \
     '.preview={operationId:$op,profileId:$profile,startedAt:(now|floor),deadline:$deadline,before:$before,lastApplied:((.lastApplied // {}) + $target),previousActiveProfile:.activeProfile,previousLastApplied:.lastApplied} | .lastOperationId=$op' <<< "$STATE_JSON")
   save_state || { json_error "preview applied but state persistence failed" 2; return; }
