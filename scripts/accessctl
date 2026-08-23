@@ -382,21 +382,24 @@ hyprland_version() {
 }
 
 capture_baseline() {
-  local source="${1:-}" values='{}' id value
+  local source="${1:-}" values id value
   local -a ids=()
-  [[ "$BASELINE_JSON" == null ]] || return 0
-  if [[ -n "$source" ]]; then
-    values="$source"
+  [[ -n "$source" ]] || { die "baseline source is required"; return 1; }
+  jq -e 'type == "object"' <<< "$source" >/dev/null 2>&1 || { die "baseline source is malformed"; return 1; }
+  if [[ "$BASELINE_JSON" == null ]]; then
+    values='{}'
+    BASELINE_JSON=$(jq -cn --arg version "$(hyprland_version)" \
+      '{schemaVersion:1,capturedAt:(now|floor),hyprlandVersion:$version,values:{}}')
   else
-    mapfile -t ids < <(jq -r 'keys[]' <<< "$SETTING_SPECS")
-    for id in "${ids[@]}"; do
-      read_setting "$id" >/dev/null || continue
-      value="$READ_VALUE"
-      values=$(jq -c --arg id "$id" --argjson value "$value" '.[$id] = $value' <<< "$values")
-    done
+    values=$(jq -c '.values' <<< "$BASELINE_JSON")
   fi
-  BASELINE_JSON=$(jq -cn --argjson values "$values" --arg version "$(hyprland_version)" \
-    '{schemaVersion:1,capturedAt:(now|floor),hyprlandVersion:$version,values:$values}')
+  mapfile -t ids < <(jq -r 'keys[]' <<< "$source")
+  for id in "${ids[@]}"; do
+    jq -e --arg id "$id" 'has($id)' <<< "$values" >/dev/null 2>&1 && continue
+    value=$(jq -c --arg id "$id" '.[$id]' <<< "$source")
+    values=$(jq -c --arg id "$id" --argjson value "$value" '.[$id] = $value' <<< "$values")
+  done
+  BASELINE_JSON=$(jq -c --argjson values "$values" '.values=$values' <<< "$BASELINE_JSON")
   atomic_write "$BASELINE_FILE" "$BASELINE_JSON"
 }
 
@@ -586,10 +589,10 @@ cmd_apply() {
   operation_seen "$operation" && { json_ok "$(jq -cn --arg op "$operation" --arg profile "$profile_id" '{operationId:$op,profileId:$profile,idempotent:true}')"; return; }
   before=$(snapshot_for_profile "$profile") || { json_error "could not read current values" 2 "$(jq -cn --arg reason "${SNAPSHOT_ERROR:-$READ_ERROR}" '{reason:$reason}')"; return; }
   target=$(target_for_profile "$profile" "$before")
-  capture_baseline || { json_error "could not capture baseline" 2; return; }
+  capture_baseline "$before" || { json_error "could not capture baseline" 2; return; }
   apply_snapshot_transaction "$before" "$target" "$operation" apply "$profile_id" || { json_error "${TX_ERROR:-apply failed}" 2; return; }
   STATE_JSON=$(jq -c --arg profile "$profile_id" --arg op "$operation" --argjson applied "$TX_APPLIED" \
-    --argjson target "$target" '.activeProfile=$profile | .lastApplied = $target | .preview=null | .conflicts=[] | .lastOperationId=$op' <<< "$STATE_JSON")
+    --argjson target "$target" '.activeProfile=$profile | .lastApplied = ((.lastApplied // {}) + $target) | .preview=null | .conflicts=[] | .lastOperationId=$op' <<< "$STATE_JSON")
   save_state || { json_error "settings applied but state persistence failed" 2; return; }
   append_history "$(jq -cn --arg op "$operation" --arg profile "$profile_id" '{at:(now|floor),operationId:$op,action:"apply",profileId:$profile,result:"ok"}')" || true
   json_ok "$(jq -cn --arg op "$operation" --arg profile "$profile_id" --argjson changes "$target" '{operationId:$op,profileId:$profile,changes:$changes}')"
@@ -604,11 +607,11 @@ cmd_preview() {
   operation_seen "$operation" && { json_ok "$(jq -cn --arg op "$operation" '{operationId:$op,idempotent:true}')"; return; }
   before=$(snapshot_for_profile "$profile") || { json_error "could not read current values" 2; return; }
   target=$(target_for_profile "$profile" "$before")
-  capture_baseline || { json_error "could not capture baseline" 2; return; }
+  capture_baseline "$before" || { json_error "could not capture baseline" 2; return; }
   deadline=$(( $(date +%s) + seconds ))
   apply_snapshot_transaction "$before" "$target" "$operation" preview "$profile_id" || { json_error "${TX_ERROR:-preview failed}" 2; return; }
   STATE_JSON=$(jq -c --arg profile "$profile_id" --arg op "$operation" --argjson before "$before" --argjson target "$target" --argjson deadline "$deadline" \
-    '.preview={operationId:$op,profileId:$profile,startedAt:(now|floor),deadline:$deadline,before:$before,lastApplied:$target,previousActiveProfile:.activeProfile,previousLastApplied:.lastApplied} | .lastOperationId=$op' <<< "$STATE_JSON")
+    '.preview={operationId:$op,profileId:$profile,startedAt:(now|floor),deadline:$deadline,before:$before,lastApplied:((.lastApplied // {}) + $target),previousActiveProfile:.activeProfile,previousLastApplied:.lastApplied} | .lastOperationId=$op' <<< "$STATE_JSON")
   save_state || { json_error "preview applied but state persistence failed" 2; return; }
   json_ok "$(jq -cn --arg op "$operation" --arg profile "$profile_id" --argjson deadline "$deadline" --argjson changes "$target" '{operationId:$op,profileId:$profile,deadline:$deadline,changes:$changes}')"
 }
@@ -645,18 +648,20 @@ cmd_cancel_preview() {
 }
 
 cmd_restore() {
-  local operation="$1" conflicts='[]' restore='{}' id baseline current last
+  local operation="$1" conflicts='[]' restore='{}' restore_before='{}' id baseline current last
   local -a ids=()
   validate_operation_id "$operation" || { json_error "invalid operation id" 2; return; }
   [[ "$BASELINE_JSON" != null ]] || { json_ok "$(jq -cn '{message:"No Access baseline is stored."}')"; return; }
   mapfile -t ids < <(jq -r '.values | keys[]' <<< "$BASELINE_JSON")
   for id in "${ids[@]}"; do
     baseline=$(jq -c --arg id "$id" '.values[$id]' <<< "$BASELINE_JSON")
+    last=$(jq -c --arg id "$id" 'if (.lastApplied | has($id)) then .lastApplied[$id] else null end' <<< "$STATE_JSON")
+    [[ "$last" != null ]] || continue
     read_setting "$id" >/dev/null || { json_error "cannot read managed setting" 2 "$(jq -cn --arg id "$id" --arg reason "$READ_ERROR" '{id:$id,reason:$reason}')"; return; }
     current="$READ_VALUE"
-    last=$(jq -c --arg id "$id" '.lastApplied[$id] // null' <<< "$STATE_JSON")
-    if [[ "$last" == null ]] || equal_values "$current" "$last"; then
+    if equal_values "$current" "$last"; then
       restore=$(jq -c --arg id "$id" --argjson value "$baseline" '.[$id]=$value' <<< "$restore")
+      restore_before=$(jq -c --arg id "$id" --argjson value "$current" '.[$id]=$value' <<< "$restore_before")
     elif equal_values "$current" "$baseline"; then
       :
     else
@@ -665,20 +670,18 @@ cmd_restore() {
     fi
   done
   conflicts=$(jq -c --argjson specs "$SETTING_SPECS" 'map(.label = $specs[.id].label)' <<< "$conflicts")
+  if [[ "$restore" != '{}' ]]; then
+    apply_snapshot_transaction "$restore_before" "$restore" "$operation" restore "$(jq -r '.activeProfile // "restore"' <<< "$STATE_JSON")" || {
+      json_error "${TX_ERROR:-restore failed}" 2
+      return
+    }
+  fi
   if [[ "$conflicts" != '[]' ]]; then
-    STATE_JSON=$(jq -c --argjson conflicts "$conflicts" '.conflicts=$conflicts' <<< "$STATE_JSON")
-    save_state || true
-    json_error "external-drift" 2 "$(jq -cn --argjson conflicts "$conflicts" '{conflicts:$conflicts}')"
+    STATE_JSON=$(jq -c --argjson conflicts "$conflicts" --arg op "$operation" '.conflicts=$conflicts | .lastOperationId=$op' <<< "$STATE_JSON")
+    save_state || { json_error "could not persist external drift state" 2; return; }
+    json_error "external-drift" 2 "$(jq -cn --argjson conflicts "$conflicts" --argjson restored "$restore" '{conflicts:$conflicts,restored:$restored}')"
     return
   fi
-  mapfile -t ids < <(jq -r 'keys[]' <<< "$restore")
-  for id in "${ids[@]}"; do
-    local value; value=$(jq -c --arg id "$id" '.[$id]' <<< "$restore")
-    apply_setting "$id" "$value" || { json_error "restore failed" 2 "$(jq -cn --arg id "$id" --arg reason "$APPLY_ERROR" '{id:$id,reason:$reason}')"; return; }
-    read_setting "$id" >/dev/null || { json_error "restore read-back failed" 2; return; }
-    current="$READ_VALUE"
-    equal_values "$current" "$value" || { json_error "restore verification failed" 2; return; }
-  done
   complete_restore "$operation" || { json_error "settings restored but state cleanup failed" 2; return; }
   json_ok "$(jq -cn --arg op "$operation" --argjson changes "$restore" '{operationId:$op,changes:$changes,activeProfile:null}')"
 }
@@ -697,7 +700,7 @@ cmd_resolve_conflict() {
     read_setting "$id" >/dev/null || { json_error "conflict restore read-back failed" 2; return; }
     current="$READ_VALUE"
     equal_values "$current" "$target" || { json_error "conflict restore verification failed" 2; return; }
-    STATE_JSON=$(jq -c --arg id "$id" 'del(.conflicts[] | select(.id == $id))' <<< "$STATE_JSON")
+    STATE_JSON=$(jq -c --arg id "$id" 'del(.lastApplied[$id]) | del(.conflicts[] | select(.id == $id))' <<< "$STATE_JSON")
   fi
   if [[ "$(jq '.conflicts | length' <<< "$STATE_JSON")" == 0 ]]; then
     complete_restore "$(jq -r '.lastOperationId // "00000000-0000-0000-0000-000000000000"' <<< "$STATE_JSON")" || { json_error "state cleanup failed" 2; return; }
