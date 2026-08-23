@@ -34,13 +34,14 @@ requires a real graphical Omarchy session or an external submission.
 
 - [ ] Recheck the live marketplace for naming/category overlap.
 - [ ] Recheck the official competition deadline and timezone.
-- [ ] Submit the exact tested public commit and record the issue URL/SHA.
+- [x] Submit the exact tested public commit and record the issue URL/SHA: [marketplace issue #1924](https://github.com/HANCORE-linux/omarchy-plugin-marketplace/issues/1924), public commit `ab15b9621b0ef7805c3c5fae15888ed9fa7749d6`.
 
-Do not describe the plugin as submitted until the external issue/form exists.
+The marketplace submission issue is open and records category `System` with tags `Bar`, `Hyprland`, and `Quickshell`. The naming/category-overlap and competition-deadline checks remain separate and are not inferred from submission.
 
 ## Evidence from 2026-08-23
 
 - Public install tested from `https://github.com/EF-Code/omarchy-access-profiles.git` at `d69f3310f70faa5dc583ac46ac49eebf7a3c4d7a`; the subsequent public revisions are documentation-only.
+- Marketplace submission issue [#1924](https://github.com/HANCORE-linux/omarchy-plugin-marketplace/issues/1924) was created for the tested public commit `ab15b9621b0ef7805c3c5fae15888ed9fa7749d6`.
 - Live session: Omarchy 4.0.0, Hyprland 0.56.2, Quickshell 0.3.0, Wayland, `eDP-1` at 1920x1080 scale 1.25 plus `DP-2` at 1024x768 scale 1.
 - Native Hyprland pointer events selected a profile on `DP-2`; click-away dismissal succeeded from both monitors.
 - Reversible headless-output test created and removed `HEADLESS-1`; no persistent monitor change remained.
