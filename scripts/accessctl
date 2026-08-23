@@ -508,7 +508,11 @@ complete_restore() {
 }
 
 cmd_capabilities() {
-  printf '%s\n' "$(json_ok "$(jq -cn --argjson capabilities "$(capabilities_json)" '{capabilities:$capabilities,hyprlandVersion:"'"$(hyprland_version | sed 's/"/\\"/g')"'"}')")"
+  local capabilities version body
+  capabilities=$(capabilities_json)
+  version=$(hyprland_version)
+  body=$(jq -cn --argjson capabilities "$capabilities" --arg version "$version" '{capabilities:$capabilities,hyprlandVersion:$version}')
+  json_ok "$body"
 }
 
 cmd_list_profiles() { jq -cn --argjson profiles "$PROFILES_JSON" '{ok:true,schemaVersion:1,profiles:$profiles}'; }
