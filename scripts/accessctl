@@ -69,13 +69,14 @@ ensure_dir() {
   local dir="$1"
   symlink_component "$dir" && { die "refusing symlink directory: $dir"; return 1; }
   mkdir -p -- "$dir" 2>/dev/null || { die "cannot create state directory"; return 1; }
-  chmod 700 -- "$dir" 2>/dev/null || true
+  chmod 700 -- "$dir" 2>/dev/null || { die "cannot secure state directory"; return 1; }
 }
 
 safe_file() {
   local file="$1"
   is_absolute "$file" || { die "state path is not absolute"; return 1; }
   [[ ! -L "$file" ]] || { die "refusing symlink state file: $file"; return 1; }
+  [[ ! -e "$file" || -f "$file" ]] || { die "refusing non-regular state file: $file"; return 1; }
   symlink_component "$(dirname -- "$file")" && { die "refusing symlink state directory"; return 1; }
   ensure_dir "$(dirname -- "$file")"
 }
@@ -99,6 +100,12 @@ atomic_write() {
   chmod 600 -- "$file" 2>/dev/null || true
 }
 
+json_file_size_ok() {
+  local file="$1" size
+  size=$(stat -c '%s' -- "$file" 2>/dev/null) || return 1
+  [[ "$size" -le 1048576 ]]
+}
+
 remove_safe_file() {
   local file="$1"
   [[ ! -e "$file" && ! -L "$file" ]] && return 0
@@ -119,7 +126,7 @@ init_paths() {
   PENDING_FILE="$PLUGIN_STATE_DIR/pending.json"
   HISTORY_FILE="$PLUGIN_STATE_DIR/history.jsonl"
   USER_PROFILES_FILE="$PLUGIN_CONFIG_DIR/profiles.json"
-  LOCK_FILE="$RUNTIME_ROOT/omarchy-access-profiles.lock"
+  LOCK_FILE="$RUNTIME_ROOT/omarchy-access-profiles-$UID/accessctl.lock"
   ensure_dir "$PLUGIN_STATE_DIR" || return 1
   ensure_dir "$PLUGIN_CONFIG_DIR" || return 1
   safe_file "$STATE_FILE" || return 1
@@ -138,14 +145,19 @@ resolve_commands() {
 
 validate_profiles_json() {
   local file="$1"
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  json_file_size_ok "$file" || return 1
   jq -e --argjson specs "$SETTING_SPECS" '
-    .schemaVersion == 1 and (.profiles | type == "array") and
+    type == "object" and ((keys - ["profiles","schemaVersion"]) | length == 0) and
+    .schemaVersion == 1 and (.profiles | type == "array" and length >= 1 and length <= 64) and
     (([.profiles[].id] | unique | length) == (.profiles | length)) and
     all(.profiles[];
+      ((keys - ["description","icon","id","name","settings"]) | length == 0) and
       (.id | type == "string" and test("^[a-z0-9][a-z0-9-]{0,63}$")) and
       (.name | type == "string" and length >= 1 and length <= 80) and
       (.description | type == "string" and length <= 240) and
-      (.settings | type == "object") and
+      ((.icon == null) or (.icon | type == "string" and length <= 64 and test("^[A-Za-z0-9_-]+$"))) and
+      (.settings | type == "object" and length > 0 and length <= 12) and
       all(.settings | to_entries[];
         . as $entry |
         ($specs[$entry.key] != null) and
@@ -223,11 +235,11 @@ read_hypr_value() {
   raw=$("$HYPRCTL_BIN" getoption "$option" -j 2>/dev/null) || return 11
   value=$(jq -c --arg type "$type" '
     if $type == "bool" then
-      if .int? != null then (.int == 1) elif .bool? != null then .bool
+      if .int? != null then (if .int == 0 or .int == 1 then (.int == 1) else error("no bool") end) elif .bool? != null then .bool
       elif .str? != null and (.str == "true" or .str == "false") then .str == "true" else error("no bool") end
     elif $type == "int" then
       if .int? != null then .int elif .float? != null and (.float | floor == .) then .float | floor
-      elif .str? != null then (.str | tonumber | floor) else error("no int") end
+      elif .str? != null then (.str | tonumber) | if floor == . then floor else error("no int") end else error("no int") end
     else
       if .float? != null then .float elif .int? != null then .int
       elif .str? != null then (.str | tonumber) else error("no number") end
@@ -339,23 +351,137 @@ equal_values() {
   jq -n -e --argjson a "$1" --argjson b "$2" 'if ($a|type) == "number" and ($b|type) == "number" then (($a - $b) | fabs) < 0.0001 else $a == $b end' >/dev/null 2>&1
 }
 
-read_state_file() {
+read_json_object() {
   local file="$1" default="$2"
   if [[ ! -e "$file" ]]; then printf '%s\n' "$default"; return 0; fi
   safe_file "$file" || return 1
-  jq -e 'type == "object" and .schemaVersion == 1' "$file" >/dev/null 2>&1 || { die "malformed state file: $file"; return 1; }
+  json_file_size_ok "$file" || { die "JSON state file is too large: $file"; return 1; }
+  jq -e 'type == "object"' "$file" >/dev/null 2>&1 || { die "malformed JSON object: $file"; return 1; }
   jq -c '.' "$file"
 }
 
-default_state() { jq -cn '{schemaVersion:1,activeProfile:null,lastApplied:{},preview:null,conflicts:[],lastOperationId:null}'; }
+validate_values_object() {
+  jq -n -e --argjson values "$1" --argjson specs "$SETTING_SPECS" '
+    def valid_value($spec; $value):
+      if $spec.type == "bool" then ($value | type == "boolean")
+      elif $spec.type == "int" then
+        ($value | type == "number" and isfinite and floor == . and . >= $spec.min and . <= $spec.max)
+      else
+        ($value | type == "number" and isfinite and . >= $spec.min and . <= $spec.max)
+      end;
+    ($values | type == "object") and
+    all($values | to_entries[]; ($specs[.key] != null) and valid_value($specs[.key]; .value))
+  ' >/dev/null 2>&1
+}
+
+validate_state_json() {
+  local state="$1" values
+  jq -e '
+    type == "object" and ((keys - ["activeProfile","conflicts","lastApplied","lastOperation","lastOperationId","preview","schemaVersion"]) | length == 0) and
+    .schemaVersion == 1 and
+    ((.activeProfile == null) or (.activeProfile | type == "string" and test("^[a-z0-9][a-z0-9-]{0,63}$"))) and
+    (.lastApplied | type == "object") and
+    ((.lastOperationId == null) or (.lastOperationId | type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"))) and
+    ((.lastOperation // null) == null or
+      (.lastOperation as $operation |
+       ($operation | type) == "object" and
+       (($operation | keys) - ["action","id","profileId"] | length == 0) and
+       ($operation.id | type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")) and
+       ($operation.action == "apply" or $operation.action == "preview" or $operation.action == "keep-preview" or $operation.action == "preview-revert" or $operation.action == "restore") and
+       ($operation.profileId | type == "string" and test("^[a-z0-9][a-z0-9-]{0,63}$")) and
+       $operation.id == .lastOperationId)) and
+    (.conflicts | type == "array" and length <= 12 and ((map(.id) | unique | length) == length)) and
+    all(.conflicts[];
+      type == "object" and
+      ((keys - ["baseline","current","id","label","lastApplied"]) | length == 0) and
+      (.id | type == "string") and
+      (.label | type == "string") and
+      has("baseline") and has("current") and has("lastApplied")) and
+    ((.preview == null) or
+      (.preview as $preview |
+       ($preview | type) == "object" and
+       (($preview | keys) - ["before","deadline","lastApplied","operationId","previousActiveProfile","previousLastApplied","profileId","startedAt"] | length == 0) and
+       ($preview.operationId | type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")) and
+       ($preview.profileId | type == "string" and test("^[a-z0-9][a-z0-9-]{0,63}$")) and
+       ($preview.startedAt | type == "number" and isfinite and floor == . and . >= 0) and
+       ($preview.deadline | type == "number" and isfinite and floor == . and . >= 0) and
+       ($preview.before | type == "object") and ($preview.lastApplied | type == "object") and
+       (($preview.previousActiveProfile == null) or ($preview.previousActiveProfile | type == "string" and test("^[a-z0-9][a-z0-9-]{0,63}$"))) and
+       ($preview.previousLastApplied | type == "object")))
+  ' <<< "$state" >/dev/null 2>&1 || return 1
+  values=$(jq -c '.lastApplied' <<< "$state")
+  validate_values_object "$values" || return 1
+  while IFS= read -r values; do validate_values_object "$values" || return 1; done < <(
+    jq -c '.conflicts[] | {(.id):.baseline}, {(.id):.current}, {(.id):.lastApplied}' <<< "$state"
+  )
+  if jq -e '.preview != null' <<< "$state" >/dev/null 2>&1; then
+    validate_values_object "$(jq -c '.preview.before' <<< "$state")" || return 1
+    validate_values_object "$(jq -c '.preview.lastApplied' <<< "$state")" || return 1
+    validate_values_object "$(jq -c '.preview.previousLastApplied' <<< "$state")" || return 1
+    jq -e '.preview as $preview | all($preview.before | keys[]; . as $id | $preview.lastApplied | has($id))' <<< "$state" >/dev/null 2>&1 || return 1
+  fi
+}
+
+validate_baseline_json() {
+  local baseline="$1"
+  jq -e '
+    type == "object" and ((keys - ["capturedAt","hyprlandVersion","schemaVersion","values"]) | length == 0) and
+    .schemaVersion == 1 and
+    (.capturedAt | type == "number" and isfinite and floor == . and . >= 0) and
+    (.hyprlandVersion | type == "string" and length <= 240) and
+    (.values | type == "object")
+  ' <<< "$baseline" >/dev/null 2>&1 || return 1
+  validate_values_object "$(jq -c '.values' <<< "$baseline")"
+}
+
+validate_pending_json() {
+  local pending="$1" values
+  jq -e '
+    . as $pending |
+    type == "object" and ((keys - ["applied","baselineChanged","baselinePrevious","before","kind","operationId","phase","profileId","schemaVersion","target"]) | length == 0) and
+    .schemaVersion == 1 and
+    (.operationId | type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")) and
+    (.kind == "apply" or .kind == "preview" or .kind == "preview-revert" or .kind == "restore") and
+    (.profileId | type == "string" and test("^[a-z0-9][a-z0-9-]{0,63}$")) and
+    (.before | type == "object") and (.target | type == "object") and
+    (.applied | type == "array" and all(.[]; type == "string") and (unique | length) == length) and
+    all(.applied[]; (. as $id | ($pending.before | has($id)) and ($pending.target | has($id)))) and
+    ((.phase // "applying") == "applying" or .phase == "applied" or .phase == "rollback-failed") and
+    ((.baselineChanged // false) | type == "boolean") and
+    ((.baselinePrevious // null) == null or ((.baselinePrevious | type) == "object"))
+  ' <<< "$pending" >/dev/null 2>&1 || return 1
+  validate_values_object "$(jq -c '.before' <<< "$pending")" || return 1
+  validate_values_object "$(jq -c '.target' <<< "$pending")" || return 1
+  if jq -e '(.baselineChanged // false) and .baselinePrevious != null' <<< "$pending" >/dev/null 2>&1; then
+    validate_baseline_json "$(jq -c '.baselinePrevious' <<< "$pending")" || return 1
+  fi
+}
+
+default_state() { jq -cn '{schemaVersion:1,activeProfile:null,lastApplied:{},preview:null,conflicts:[],lastOperationId:null,lastOperation:null}'; }
 
 load_state() {
-  STATE_JSON=$(read_state_file "$STATE_FILE" "$(default_state)") || return 1
+  STATE_JSON=$(read_json_object "$STATE_FILE" "$(default_state)") || return 1
+  validate_state_json "$STATE_JSON" || { die "malformed state"; return 1; }
   if [[ -f "$BASELINE_FILE" ]]; then
-    BASELINE_JSON=$(read_state_file "$BASELINE_FILE" '{}') || return 1
-    jq -e 'type == "object" and .schemaVersion == 1 and (.values | type == "object")' <<< "$BASELINE_JSON" >/dev/null 2>&1 || { die "malformed baseline"; return 1; }
+    BASELINE_JSON=$(read_json_object "$BASELINE_FILE" '{}') || return 1
+    validate_baseline_json "$BASELINE_JSON" || { die "malformed baseline"; return 1; }
   else
     BASELINE_JSON='null'
+  fi
+  if [[ "$BASELINE_JSON" == null ]]; then
+    jq -e '.activeProfile == null and .preview == null and (.conflicts | length == 0) and (.lastApplied | length == 0)' <<< "$STATE_JSON" >/dev/null 2>&1 || { die "state requires a missing baseline"; return 1; }
+  else
+    jq -e --argjson baseline "$BASELINE_JSON" '
+      . as $state |
+      all($state.lastApplied | keys[]; . as $id | $baseline.values | has($id)) and
+      (if $state.preview == null then true else
+        all($state.preview.lastApplied | keys[]; . as $id | $baseline.values | has($id)) and
+        all($state.preview.before | keys[]; . as $id | $baseline.values | has($id))
+       end) and
+      all($state.conflicts[];
+        . as $conflict | ($baseline.values | has($conflict.id)) and
+        ($baseline.values[$conflict.id] == $conflict.baseline))
+    ' <<< "$STATE_JSON" >/dev/null 2>&1 || { die "state and baseline do not agree"; return 1; }
   fi
 }
 
@@ -363,18 +489,27 @@ save_state() { atomic_write "$STATE_FILE" "$STATE_JSON"; }
 
 append_history() {
   local event="$1" existing combined trimmed
-  [[ -f "$HISTORY_FILE" ]] && existing=$(<"$HISTORY_FILE") || existing=""
+  [[ -f "$HISTORY_FILE" ]] && existing=$(tail -c 262144 -- "$HISTORY_FILE" 2>/dev/null) || existing=""
   combined="$existing${existing:+$'\n'}$event"
-  trimmed=$(printf '%s\n' "$combined" | tail -n 50 | head -c 262144)
+  trimmed=$(printf '%s\n' "$combined" | tail -n 50 | tail -c 262144)
   atomic_write "$HISTORY_FILE" "$trimmed"
 }
 
 write_pending() { atomic_write "$PENDING_FILE" "$1"; }
 clear_pending() { remove_safe_file "$PENDING_FILE"; }
 
-operation_seen() {
-  local operation="$1"
-  [[ -n "$operation" ]] && jq -e --arg op "$operation" '.lastOperationId == $op' <<< "$STATE_JSON" >/dev/null 2>&1
+classify_operation() {
+  local operation="$1" action="$2" profile_id="$3"
+  OPERATION_STATUS=new
+  jq -e --arg op "$operation" '.lastOperationId == $op' <<< "$STATE_JSON" >/dev/null 2>&1 || return 0
+  if jq -e --arg op "$operation" --arg action "$action" --arg profile "$profile_id" '
+    (.lastOperation // null) == null or
+    (.lastOperation.id == $op and .lastOperation.action == $action and .lastOperation.profileId == $profile)
+  ' <<< "$STATE_JSON" >/dev/null 2>&1; then
+    OPERATION_STATUS=replay
+  else
+    OPERATION_STATUS=reused
+  fi
 }
 
 hyprland_version() {
@@ -405,9 +540,13 @@ capture_baseline() {
   done
   BASELINE_JSON=$(jq -c --argjson values "$values" '.values=$values' <<< "$BASELINE_JSON")
   if [[ "$BASELINE_JSON" != "$BASELINE_PREVIOUS_JSON" ]]; then
-    atomic_write "$BASELINE_FILE" "$BASELINE_JSON" || return 1
     BASELINE_CAPTURE_CHANGED=true
   fi
+}
+
+persist_baseline_capture() {
+  [[ "$BASELINE_CAPTURE_CHANGED" == true ]] || return 0
+  atomic_write "$BASELINE_FILE" "$BASELINE_JSON"
 }
 
 rollback_baseline_capture() {
@@ -486,28 +625,44 @@ rollback_applied() {
 }
 
 apply_snapshot_transaction() {
-  local before="$1" target="$2" operation="$3" kind="$4" profile_id="$5" applied='[]' id value current
+  local before="$1" target="$2" operation="$3" kind="$4" profile_id="$5" applied='[]' next_applied id value current
   local -a ids=()
   local pending
-  pending=$(jq -cn --arg op "$operation" --arg kind "$kind" --arg profile "$profile_id" --argjson before "$before" --argjson target "$target" \
-    '{schemaVersion:1,operationId:$op,kind:$kind,profileId:$profile,before:$before,target:$target,applied:[]}')
+  pending=$(jq -cn --arg op "$operation" --arg kind "$kind" --arg profile "$profile_id" \
+    --argjson before "$before" --argjson target "$target" --argjson baselinePrevious "$BASELINE_PREVIOUS_JSON" \
+    --argjson baselineChanged "$BASELINE_CAPTURE_CHANGED" \
+    '{schemaVersion:1,operationId:$op,kind:$kind,profileId:$profile,before:$before,target:$target,applied:[],phase:"applying",baselineChanged:$baselineChanged,baselinePrevious:$baselinePrevious}')
   write_pending "$pending" || return 1
+  if ! persist_baseline_capture; then
+    clear_pending || true
+    TX_ERROR="could not persist baseline"
+    return 1
+  fi
   mapfile -t ids < <(jq -r 'keys[]' <<< "$target")
   for id in "${ids[@]}"; do
     value=$(jq -c --arg id "$id" '.[$id]' <<< "$target")
-    applied=$(jq -c --arg id "$id" '. + [$id]' <<< "$applied")
-    pending=$(jq -c --argjson applied "$applied" '.applied = $applied' <<< "$pending")
-    write_pending "$pending" || { TX_ERROR="could not update pending journal"; return 1; }
+    next_applied=$(jq -c --arg id "$id" '. + [$id]' <<< "$applied")
+    pending=$(jq -c --argjson applied "$next_applied" '.applied = $applied' <<< "$pending")
+    if ! write_pending "$pending"; then
+      rollback_applied "$before" "$applied"
+      rollback_baseline_capture || ROLLBACK_OK=false
+      [[ "$ROLLBACK_OK" == true ]] && clear_pending || true
+      TX_ERROR="could not update pending journal"
+      return 1
+    fi
+    applied="$next_applied"
     apply_setting "$id" "$value" || {
       rollback_applied "$before" "$applied"
-      if [[ "$ROLLBACK_OK" == true ]]; then clear_pending; else write_pending "$(jq -c --arg phase rollback-failed '. + {phase:$phase}' <<< "$pending")"; fi
+      rollback_baseline_capture || ROLLBACK_OK=false
+      if [[ "$ROLLBACK_OK" == true ]]; then clear_pending; else write_pending "$(jq -c '.phase="rollback-failed"' <<< "$pending")"; fi
       TX_ERROR="apply failed for $id: $APPLY_ERROR"
       [[ "$ROLLBACK_OK" == true ]] && TX_ERROR="$TX_ERROR; rollback verified"
       return 1
     }
     read_setting "$id" >/dev/null || {
       rollback_applied "$before" "$applied"
-      if [[ "$ROLLBACK_OK" == true ]]; then clear_pending; else write_pending "$(jq -c --arg phase rollback-failed '. + {phase:$phase}' <<< "$pending")"; fi
+      rollback_baseline_capture || ROLLBACK_OK=false
+      if [[ "$ROLLBACK_OK" == true ]]; then clear_pending; else write_pending "$(jq -c '.phase="rollback-failed"' <<< "$pending")"; fi
       TX_ERROR="could not read back $id"
       [[ "$ROLLBACK_OK" == true ]] && TX_ERROR="$TX_ERROR; rollback verified"
       return 1
@@ -515,15 +670,35 @@ apply_snapshot_transaction() {
     current="$READ_VALUE"
     if ! equal_values "$current" "$value"; then
       rollback_applied "$before" "$applied"
-      if [[ "$ROLLBACK_OK" == true ]]; then clear_pending; else write_pending "$(jq -c --arg phase rollback-failed '. + {phase:$phase}' <<< "$pending")"; fi
+      rollback_baseline_capture || ROLLBACK_OK=false
+      if [[ "$ROLLBACK_OK" == true ]]; then clear_pending; else write_pending "$(jq -c '.phase="rollback-failed"' <<< "$pending")"; fi
       TX_ERROR="read-back verification failed for $id"
       [[ "$ROLLBACK_OK" == true ]] && TX_ERROR="$TX_ERROR; rollback verified"
       return 1
     fi
   done
-  clear_pending || { TX_ERROR="could not clear pending journal"; return 1; }
+  pending=$(jq -c '.phase="applied"' <<< "$pending")
+  if ! write_pending "$pending"; then
+    rollback_applied "$before" "$applied"
+    rollback_baseline_capture || ROLLBACK_OK=false
+    [[ "$ROLLBACK_OK" == true ]] && clear_pending || true
+    TX_ERROR="could not finalize pending journal"
+    return 1
+  fi
   TX_APPLIED="$applied"
   return 0
+}
+
+abort_snapshot_transaction() {
+  local before="$1" applied="$2"
+  rollback_applied "$before" "$applied"
+  rollback_baseline_capture || ROLLBACK_OK=false
+  if [[ "$ROLLBACK_OK" == true ]]; then clear_pending || ROLLBACK_OK=false; fi
+}
+
+commit_snapshot_transaction() {
+  commit_baseline_capture
+  clear_pending
 }
 
 snapshot_for_profile() {
@@ -544,31 +719,62 @@ snapshot_for_profile() {
 
 complete_restore() {
   local operation="$1"
-  STATE_JSON=$(jq -c --arg op "$operation" '.activeProfile = null | .lastApplied = {} | .preview = null | .conflicts = [] | .lastOperationId = $op' <<< "$STATE_JSON")
+  RESTORE_STATE_COMMITTED=false
+  STATE_JSON=$(jq -c --arg op "$operation" '.activeProfile = null | .lastApplied = {} | .preview = null | .conflicts = [] | .lastOperationId = $op | .lastOperation={id:$op,action:"restore",profileId:"restore"}' <<< "$STATE_JSON")
   save_state || return 1
+  RESTORE_STATE_COMMITTED=true
   remove_safe_file "$BASELINE_FILE" || return 1
   BASELINE_JSON=null
-  append_history "$(jq -cn --arg op "$operation" '{at:(now|floor),operationId:$op,action:"restore",result:"ok"}')" || return 1
+  append_history "$(jq -cn --arg op "$operation" '{at:(now|floor),operationId:$op,action:"restore",result:"ok"}')" || true
+}
+
+revert_preview() {
+  local preview="$1" operation="$2" restore='{}' restore_before='{}' drift='[]' id original expected current
+  local -a ids=()
+  mapfile -t ids < <(jq -r '.before | keys[]' <<< "$preview")
+  for id in "${ids[@]}"; do
+    original=$(jq -c --arg id "$id" '.before[$id]' <<< "$preview")
+    expected=$(jq -c --arg id "$id" '.lastApplied[$id]' <<< "$preview")
+    read_setting "$id" >/dev/null || { PREVIEW_REVERT_ERROR="could not read $id: $READ_ERROR"; return 1; }
+    current="$READ_VALUE"
+    if equal_values "$current" "$expected"; then
+      restore=$(jq -c --arg id "$id" --argjson value "$original" '.[$id]=$value' <<< "$restore")
+      restore_before=$(jq -c --arg id "$id" --argjson value "$current" '.[$id]=$value' <<< "$restore_before")
+    elif ! equal_values "$current" "$original"; then
+      drift=$(jq -c --arg id "$id" '. + [$id]' <<< "$drift")
+    fi
+  done
+  apply_snapshot_transaction "$restore_before" "$restore" "$operation" preview-revert "$(jq -r '.profileId' <<< "$preview")" || {
+    PREVIEW_REVERT_ERROR="${TX_ERROR:-preview rollback failed}"
+    return 1
+  }
+  STATE_JSON=$(jq -c --arg op "$operation" --argjson drift "$drift" '
+    .preview as $preview |
+    .activeProfile=(if ($drift | length) == 0 then $preview.previousActiveProfile else null end) |
+    .lastApplied=($preview.previousLastApplied | with_entries(.key as $id | select($drift | index($id) | not))) |
+    .preview=null | .lastOperationId=$op | .lastOperation={id:$op,action:"preview-revert",profileId:$preview.profileId}
+  ' <<< "$STATE_JSON")
+  if ! save_state; then
+    abort_snapshot_transaction "$restore_before" "$TX_APPLIED"
+    PREVIEW_REVERT_ERROR="$([[ "$ROLLBACK_OK" == true ]] && echo "preview state persistence failed; rollback reverted" || echo "preview state persistence failed; recovery is required")"
+    return 1
+  fi
+  commit_snapshot_transaction || { PREVIEW_REVERT_ERROR="preview reverted but journal cleanup is pending"; return 1; }
+  PREVIEW_REVERT_DRIFT="$drift"
+  PREVIEW_REVERT_CHANGES="$restore"
 }
 
 recover_expired_preview() {
-  local preview before deadline now id value
-  local -a ids=()
+  local preview deadline now operation
   RECOVERED_PREVIEW=false
   preview=$(jq -c '.preview // empty' <<< "$STATE_JSON")
   [[ -n "$preview" ]] || return 0
   deadline=$(jq -r '.deadline // 0' <<< "$preview")
   now=$(date +%s)
   [[ "$deadline" =~ ^[0-9]+$ && "$deadline" -le "$now" ]] || return 0
-  before=$(jq -c '.before' <<< "$preview")
-  mapfile -t ids < <(jq -r 'keys[]' <<< "$before")
-  for id in "${ids[@]}"; do
-    value=$(jq -c --arg id "$id" '.[$id]' <<< "$before")
-    apply_setting "$id" "$value" || return 1
-  done
-  STATE_JSON=$(jq -c '.activeProfile=.preview.previousActiveProfile | .lastApplied=.preview.previousLastApplied | .preview=null' <<< "$STATE_JSON")
-  save_state || return 1
-  append_history "$(jq -cn '{at:(now|floor),action:"recover-preview",result:"ok"}')" || true
+  operation=$(jq -r '.operationId' <<< "$preview")
+  revert_preview "$preview" "$operation" || return 1
+  append_history "$(jq -cn --argjson drift "$PREVIEW_REVERT_DRIFT" '{at:(now|floor),action:"recover-preview",result:"ok",preservedExternal:$drift}')" || true
   RECOVERED_PREVIEW=true
 }
 
@@ -610,19 +816,28 @@ cmd_apply() {
   profile=$(profile_json "$profile_id") || { json_error "unknown profile" 2; return; }
   [[ -n "$profile" ]] || { json_error "unknown profile" 2; return; }
   validate_operation_id "$operation" || { json_error "invalid operation id" 2; return; }
-  operation_seen "$operation" && { json_ok "$(jq -cn --arg op "$operation" --arg profile "$profile_id" '{operationId:$op,profileId:$profile,idempotent:true}')"; return; }
+  classify_operation "$operation" apply "$profile_id"
+  [[ "$OPERATION_STATUS" != replay ]] || { json_ok "$(jq -cn --arg op "$operation" --arg profile "$profile_id" '{operationId:$op,profileId:$profile,idempotent:true}')"; return; }
+  [[ "$OPERATION_STATUS" != reused ]] || { json_error "operation-id-reused" 2; return; }
+  jq -e '.preview == null' <<< "$STATE_JSON" >/dev/null 2>&1 || { json_error "preview-active" 2; return; }
+  jq -e '.conflicts | length == 0' <<< "$STATE_JSON" >/dev/null 2>&1 || { json_error "external-drift-pending" 2; return; }
   before=$(snapshot_for_profile "$profile") || { json_error "could not read current values" 2 "$(jq -cn --arg reason "${SNAPSHOT_ERROR:-$READ_ERROR}" '{reason:$reason}')"; return; }
   target=$(target_for_profile "$profile" "$before")
+  [[ "$target" != '{}' ]] || { json_error "no supported settings are available for this profile" 2; return; }
   capture_baseline "$before" || { json_error "could not capture baseline" 2; return; }
   if ! apply_snapshot_transaction "$before" "$target" "$operation" apply "$profile_id"; then
     rollback_baseline_capture || true
     json_error "${TX_ERROR:-apply failed}" 2
     return
   fi
-  commit_baseline_capture
   STATE_JSON=$(jq -c --arg profile "$profile_id" --arg op "$operation" --argjson applied "$TX_APPLIED" \
-    --argjson target "$target" '.activeProfile=$profile | .lastApplied = ((.lastApplied // {}) + $target) | .preview=null | .conflicts=[] | .lastOperationId=$op' <<< "$STATE_JSON")
-  save_state || { json_error "settings applied but state persistence failed" 2; return; }
+    --argjson target "$target" '.activeProfile=$profile | .lastApplied = ((.lastApplied // {}) + $target) | .preview=null | .conflicts=[] | .lastOperationId=$op | .lastOperation={id:$op,action:"apply",profileId:$profile}' <<< "$STATE_JSON")
+  if ! save_state; then
+    abort_snapshot_transaction "$before" "$TX_APPLIED"
+    json_error "$([[ "$ROLLBACK_OK" == true ]] && echo "state persistence failed; settings rolled back" || echo "state persistence failed; recovery is required")" 2
+    return
+  fi
+  commit_snapshot_transaction || { json_error "settings committed but journal cleanup is pending" 2; return; }
   append_history "$(jq -cn --arg op "$operation" --arg profile "$profile_id" '{at:(now|floor),operationId:$op,action:"apply",profileId:$profile,result:"ok"}')" || true
   json_ok "$(jq -cn --arg op "$operation" --arg profile "$profile_id" --argjson changes "$target" '{operationId:$op,profileId:$profile,changes:$changes}')"
 }
@@ -633,9 +848,14 @@ cmd_preview() {
   profile=$(profile_json "$profile_id") || { json_error "unknown profile" 2; return; }
   [[ -n "$profile" ]] || { json_error "unknown profile" 2; return; }
   validate_operation_id "$operation" || { json_error "invalid operation id" 2; return; }
-  operation_seen "$operation" && { json_ok "$(jq -cn --arg op "$operation" '{operationId:$op,idempotent:true}')"; return; }
+  classify_operation "$operation" preview "$profile_id"
+  [[ "$OPERATION_STATUS" != replay ]] || { json_ok "$(jq -cn --arg op "$operation" '{operationId:$op,idempotent:true}')"; return; }
+  [[ "$OPERATION_STATUS" != reused ]] || { json_error "operation-id-reused" 2; return; }
+  jq -e '.preview == null' <<< "$STATE_JSON" >/dev/null 2>&1 || { json_error "preview-active" 2; return; }
+  jq -e '.conflicts | length == 0' <<< "$STATE_JSON" >/dev/null 2>&1 || { json_error "external-drift-pending" 2; return; }
   before=$(snapshot_for_profile "$profile") || { json_error "could not read current values" 2; return; }
   target=$(target_for_profile "$profile" "$before")
+  [[ "$target" != '{}' ]] || { json_error "no supported settings are available for this profile" 2; return; }
   capture_baseline "$before" || { json_error "could not capture baseline" 2; return; }
   deadline=$(( $(date +%s) + seconds ))
   if ! apply_snapshot_transaction "$before" "$target" "$operation" preview "$profile_id"; then
@@ -643,48 +863,60 @@ cmd_preview() {
     json_error "${TX_ERROR:-preview failed}" 2
     return
   fi
-  commit_baseline_capture
   STATE_JSON=$(jq -c --arg profile "$profile_id" --arg op "$operation" --argjson before "$before" --argjson target "$target" --argjson deadline "$deadline" \
-    '.preview={operationId:$op,profileId:$profile,startedAt:(now|floor),deadline:$deadline,before:$before,lastApplied:((.lastApplied // {}) + $target),previousActiveProfile:.activeProfile,previousLastApplied:.lastApplied} | .lastOperationId=$op' <<< "$STATE_JSON")
-  save_state || { json_error "preview applied but state persistence failed" 2; return; }
+    '.preview={operationId:$op,profileId:$profile,startedAt:(now|floor),deadline:$deadline,before:$before,lastApplied:((.lastApplied // {}) + $target),previousActiveProfile:.activeProfile,previousLastApplied:.lastApplied} | .lastOperationId=$op | .lastOperation={id:$op,action:"preview",profileId:$profile}' <<< "$STATE_JSON")
+  if ! save_state; then
+    abort_snapshot_transaction "$before" "$TX_APPLIED"
+    json_error "$([[ "$ROLLBACK_OK" == true ]] && echo "preview persistence failed; settings rolled back" || echo "preview persistence failed; recovery is required")" 2
+    return
+  fi
+  commit_snapshot_transaction || { json_error "preview committed but journal cleanup is pending" 2; return; }
   json_ok "$(jq -cn --arg op "$operation" --arg profile "$profile_id" --argjson deadline "$deadline" --argjson changes "$target" '{operationId:$op,profileId:$profile,deadline:$deadline,changes:$changes}')"
 }
 
 cmd_keep_preview() {
-  local operation="$1" preview
-  validate_operation_id "$operation" || { json_error "invalid operation id" 2; return; }
-  preview=$(jq -c '.preview // empty' <<< "$STATE_JSON")
-  [[ -n "$preview" ]] || { json_error "no active preview" 2; return; }
-  jq -e --arg op "$operation" '.operationId == $op' <<< "$preview" >/dev/null 2>&1 || { json_error "operation id does not match preview" 2; return; }
-  STATE_JSON=$(jq -c --arg op "$operation" '.activeProfile=.preview.profileId | .lastApplied=.preview.lastApplied | .preview=null | .conflicts=[] | .lastOperationId=$op' <<< "$STATE_JSON")
-  save_state || { json_error "could not persist kept preview" 2; return; }
-  append_history "$(jq -cn --arg op "$operation" '{at:(now|floor),operationId:$op,action:"keep-preview",result:"ok"}')" || true
-  json_ok "$(jq -cn --arg op "$operation" '{operationId:$op,preview:null}')"
-}
-
-cmd_cancel_preview() {
-  local operation="$1" preview before id value
+  local operation="$1" preview drift='[]' id expected current
   local -a ids=()
   validate_operation_id "$operation" || { json_error "invalid operation id" 2; return; }
   preview=$(jq -c '.preview // empty' <<< "$STATE_JSON")
   [[ -n "$preview" ]] || { json_error "no active preview" 2; return; }
   jq -e --arg op "$operation" '.operationId == $op' <<< "$preview" >/dev/null 2>&1 || { json_error "operation id does not match preview" 2; return; }
-  before=$(jq -c '.before' <<< "$preview")
-  mapfile -t ids < <(jq -r 'keys[]' <<< "$before")
+  mapfile -t ids < <(jq -r '.before | keys[]' <<< "$preview")
   for id in "${ids[@]}"; do
-    value=$(jq -c --arg id "$id" '.[$id]' <<< "$before")
-    apply_setting "$id" "$value" || { json_error "preview rollback failed" 2; return; }
+    expected=$(jq -c --arg id "$id" '.lastApplied[$id]' <<< "$preview")
+    read_setting "$id" >/dev/null || { json_error "could not verify preview before keeping it" 2 "$(jq -cn --arg id "$id" --arg reason "$READ_ERROR" '{id:$id,reason:$reason}')"; return; }
+    current="$READ_VALUE"
+    equal_values "$current" "$expected" || drift=$(jq -c --arg id "$id" '. + [$id]' <<< "$drift")
   done
-  STATE_JSON=$(jq -c --arg op "$operation" '.activeProfile=.preview.previousActiveProfile | .lastApplied=.preview.previousLastApplied | .preview=null | .lastOperationId=$op' <<< "$STATE_JSON")
-  save_state || { json_error "preview reverted but state persistence failed" 2; return; }
-  append_history "$(jq -cn --arg op "$operation" '{at:(now|floor),operationId:$op,action:"cancel-preview",result:"ok"}')" || true
-  json_ok "$(jq -cn --arg op "$operation" '{operationId:$op,preview:null}')"
+  STATE_JSON=$(jq -c --arg op "$operation" --argjson drift "$drift" '
+    .preview as $preview |
+    .activeProfile=(if ($drift | length) == 0 then $preview.profileId else null end) |
+    .lastApplied=($preview.lastApplied | with_entries(.key as $id | select($drift | index($id) | not))) |
+    .preview=null | .conflicts=[] | .lastOperationId=$op |
+    .lastOperation={id:$op,action:"keep-preview",profileId:$preview.profileId}
+  ' <<< "$STATE_JSON")
+  save_state || { json_error "could not persist kept preview" 2; return; }
+  append_history "$(jq -cn --arg op "$operation" --argjson drift "$drift" '{at:(now|floor),operationId:$op,action:"keep-preview",result:"ok",preservedExternal:$drift}')" || true
+  json_ok "$(jq -cn --arg op "$operation" --argjson drift "$drift" '{operationId:$op,preview:null,preservedExternal:$drift}')"
+}
+
+cmd_cancel_preview() {
+  local operation="$1" preview
+  validate_operation_id "$operation" || { json_error "invalid operation id" 2; return; }
+  preview=$(jq -c '.preview // empty' <<< "$STATE_JSON")
+  [[ -n "$preview" ]] || { json_error "no active preview" 2; return; }
+  jq -e --arg op "$operation" '.operationId == $op' <<< "$preview" >/dev/null 2>&1 || { json_error "operation id does not match preview" 2; return; }
+  revert_preview "$preview" "$operation" || { json_error "${PREVIEW_REVERT_ERROR:-preview rollback failed}" 2; return; }
+  append_history "$(jq -cn --arg op "$operation" --argjson drift "$PREVIEW_REVERT_DRIFT" '{at:(now|floor),operationId:$op,action:"cancel-preview",result:"ok",preservedExternal:$drift}')" || true
+  json_ok "$(jq -cn --arg op "$operation" --argjson drift "$PREVIEW_REVERT_DRIFT" --argjson changes "$PREVIEW_REVERT_CHANGES" '{operationId:$op,preview:null,preservedExternal:$drift,changes:$changes}')"
 }
 
 cmd_restore() {
   local operation="$1" conflicts='[]' restore='{}' restore_before='{}' id baseline current last
   local -a ids=()
   validate_operation_id "$operation" || { json_error "invalid operation id" 2; return; }
+  jq -e '.preview == null' <<< "$STATE_JSON" >/dev/null 2>&1 || { json_error "preview-active" 2; return; }
+  jq -e '.conflicts | length == 0' <<< "$STATE_JSON" >/dev/null 2>&1 || { json_error "external-drift-pending" 2; return; }
   [[ "$BASELINE_JSON" != null ]] || { json_ok "$(jq -cn '{message:"No Access baseline is stored."}')"; return; }
   mapfile -t ids < <(jq -r '.values | keys[]' <<< "$BASELINE_JSON")
   for id in "${ids[@]}"; do
@@ -704,36 +936,57 @@ cmd_restore() {
     fi
   done
   conflicts=$(jq -c --argjson specs "$SETTING_SPECS" 'map(.label = $specs[.id].label)' <<< "$conflicts")
-  if [[ "$restore" != '{}' ]]; then
-    apply_snapshot_transaction "$restore_before" "$restore" "$operation" restore "$(jq -r '.activeProfile // "restore"' <<< "$STATE_JSON")" || {
-      json_error "${TX_ERROR:-restore failed}" 2
-      return
-    }
-  fi
+  apply_snapshot_transaction "$restore_before" "$restore" "$operation" restore "$(jq -r '.activeProfile // "restore"' <<< "$STATE_JSON")" || {
+    json_error "${TX_ERROR:-restore failed}" 2
+    return
+  }
   if [[ "$conflicts" != '[]' ]]; then
-    STATE_JSON=$(jq -c --argjson conflicts "$conflicts" --arg op "$operation" '.conflicts=$conflicts | .lastOperationId=$op' <<< "$STATE_JSON")
-    save_state || { json_error "could not persist external drift state" 2; return; }
+    STATE_JSON=$(jq -c --argjson conflicts "$conflicts" --arg op "$operation" '
+      .activeProfile=null | .preview=null | .conflicts=$conflicts | .lastOperationId=$op | .lastOperation={id:$op,action:"restore",profileId:"restore"} |
+      .lastApplied = (.lastApplied | with_entries(.key as $id | select(any($conflicts[]; .id == $id))))
+    ' <<< "$STATE_JSON")
+    if ! save_state; then
+      abort_snapshot_transaction "$restore_before" "$TX_APPLIED"
+      json_error "$([[ "$ROLLBACK_OK" == true ]] && echo "could not persist external drift state; safe restores rolled back" || echo "could not persist external drift state; recovery is required")" 2
+      return
+    fi
+    commit_snapshot_transaction || { json_error "external drift saved but journal cleanup is pending" 2; return; }
     json_error "external-drift" 2 "$(jq -cn --argjson conflicts "$conflicts" --argjson restored "$restore" '{conflicts:$conflicts,restored:$restored}')"
     return
   fi
-  complete_restore "$operation" || { json_error "settings restored but state cleanup failed" 2; return; }
+  if ! complete_restore "$operation"; then
+    if [[ "$RESTORE_STATE_COMMITTED" != true ]]; then abort_snapshot_transaction "$restore_before" "$TX_APPLIED"; fi
+    json_error "settings restored but state cleanup failed" 2
+    return
+  fi
+  commit_snapshot_transaction || { json_error "settings restored but journal cleanup is pending" 2; return; }
   json_ok "$(jq -cn --arg op "$operation" --argjson changes "$restore" '{operationId:$op,changes:$changes,activeProfile:null}')"
 }
 
 cmd_resolve_conflict() {
-  local id="$1" mode="$2" conflict target current
+  local id="$1" mode="$2" conflict target current recorded
   validate_setting_id "$id" || { json_error "unknown setting" 2; return; }
   conflict=$(jq -c --arg id "$id" '[.conflicts[]? | select(.id == $id)] | if length == 1 then .[0] else empty end' <<< "$STATE_JSON")
   [[ -n "$conflict" ]] || { json_error "conflict not found" 2; return; }
   if [[ "$mode" == keep ]]; then
-    target=$(jq -c '.current' <<< "$conflict")
     STATE_JSON=$(jq -c --arg id "$id" 'del(.lastApplied[$id]) | .conflicts |= map(select(.id != $id))' <<< "$STATE_JSON")
   else
     target=$(jq -c '.baseline' <<< "$conflict")
-    apply_setting "$id" "$target" || { json_error "conflict restore failed" 2; return; }
-    read_setting "$id" >/dev/null || { json_error "conflict restore read-back failed" 2; return; }
+    recorded=$(jq -c '.current' <<< "$conflict")
+    read_setting "$id" >/dev/null || { json_error "conflict setting could not be read" 2; return; }
     current="$READ_VALUE"
-    equal_values "$current" "$target" || { json_error "conflict restore verification failed" 2; return; }
+    if ! equal_values "$current" "$target"; then
+      if ! equal_values "$current" "$recorded"; then
+        STATE_JSON=$(jq -c --arg id "$id" --argjson current "$current" '(.conflicts[] | select(.id == $id) | .current) = $current' <<< "$STATE_JSON")
+        save_state || { json_error "external drift changed again and could not be recorded" 2; return; }
+        json_error "external-drift-changed" 2 "$(jq -cn --arg id "$id" --argjson current "$current" '{id:$id,current:$current}')"
+        return
+      fi
+      apply_setting "$id" "$target" || { json_error "conflict restore failed" 2; return; }
+      read_setting "$id" >/dev/null || { json_error "conflict restore read-back failed" 2; return; }
+      current="$READ_VALUE"
+      equal_values "$current" "$target" || { json_error "conflict restore verification failed" 2; return; }
+    fi
     STATE_JSON=$(jq -c --arg id "$id" 'del(.lastApplied[$id]) | del(.conflicts[] | select(.id == $id))' <<< "$STATE_JSON")
   fi
   if [[ "$(jq '.conflicts | length' <<< "$STATE_JSON")" == 0 ]]; then
@@ -745,17 +998,42 @@ cmd_resolve_conflict() {
 }
 
 cmd_recover() {
-  local pending phase before id value
-  local -a ids=()
+  local pending before applied operation kind previous
   if [[ -f "$PENDING_FILE" ]]; then
-    pending=$(read_state_file "$PENDING_FILE" '{}') || { json_error "pending journal is malformed" 2; return; }
-    before=$(jq -c '.before' <<< "$pending")
-    mapfile -t ids < <(jq -r 'keys[]' <<< "$before")
-    for id in "${ids[@]}"; do
-      value=$(jq -c --arg id "$id" '.[$id]' <<< "$before")
-      apply_setting "$id" "$value" || { json_error "recovery rollback failed" 2 "$(jq -cn --arg id "$id" '{id:$id}')"; return; }
-    done
-    clear_pending || { json_error "recovered settings but journal cleanup failed" 2; return; }
+    pending=$(read_json_object "$PENDING_FILE" '{}') || { json_error "pending journal is malformed" 2; return; }
+    validate_pending_json "$pending" || { json_error "pending journal is malformed" 2; return; }
+    operation=$(jq -r '.operationId' <<< "$pending")
+    kind=$(jq -r '.kind' <<< "$pending")
+    if jq -e --arg op "$operation" --arg kind "$kind" --arg profile "$(jq -r '.profileId' <<< "$pending")" '
+      .lastOperationId == $op and
+      (if $kind == "apply" then .activeProfile == $profile and .preview == null
+       elif $kind == "preview" then .preview.operationId == $op
+       elif $kind == "preview-revert" then .preview == null
+       else .activeProfile == null and .preview == null
+       end)
+    ' <<< "$STATE_JSON" >/dev/null 2>&1; then
+      if [[ "$kind" == restore ]] && jq -e '.conflicts | length == 0' <<< "$STATE_JSON" >/dev/null 2>&1; then
+        remove_safe_file "$BASELINE_FILE" || { json_error "restore committed but baseline cleanup failed" 2; return; }
+        BASELINE_JSON=null
+      fi
+      clear_pending || { json_error "committed operation journal cleanup failed" 2; return; }
+    else
+      before=$(jq -c '.before' <<< "$pending")
+      applied=$(jq -c '.applied' <<< "$pending")
+      rollback_applied "$before" "$applied"
+      [[ "$ROLLBACK_OK" == true ]] || { json_error "recovery rollback failed" 2; return; }
+      if jq -e '.baselineChanged // false' <<< "$pending" >/dev/null 2>&1; then
+        previous=$(jq -c '.baselinePrevious // null' <<< "$pending")
+        if [[ "$previous" == null ]]; then
+          remove_safe_file "$BASELINE_FILE" || { json_error "recovery baseline cleanup failed" 2; return; }
+          BASELINE_JSON=null
+        else
+          atomic_write "$BASELINE_FILE" "$previous" || { json_error "recovery baseline rollback failed" 2; return; }
+          BASELINE_JSON="$previous"
+        fi
+      fi
+      clear_pending || { json_error "recovered settings but journal cleanup failed" 2; return; }
+    fi
   fi
   recover_expired_preview || { json_error "expired preview rollback failed" 2; return; }
   if [[ "$RECOVERED_PREVIEW" == true ]]; then json_ok '{"recoveredPreview":true}'; else json_ok '{"recovered":false}'; fi
