@@ -1,0 +1,741 @@
+#!/usr/bin/env bash
+# Local, unprivileged backend for Omarchy Access Profiles.
+#
+# stdout is reserved for exactly one compact JSON response. Diagnostics from
+# dependencies are redirected to stderr so QML can safely parse the result.
+set -u
+set -o pipefail
+umask 077
+
+readonly SCHEMA_VERSION=1
+readonly SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+readonly DEFAULT_PROFILES_FILE="$SCRIPT_DIR/../profiles/defaults.json"
+readonly SETTING_SPECS='{"gtk.animations.enabled":{"type":"bool","scope":"GTK applications","label":"GTK animations","adapter":"gsettings","schema":"org.gnome.desktop.interface","key":"enable-animations"},"gtk.cursor.size":{"type":"int","min":16,"max":128,"scope":"GTK applications","label":"GTK cursor size","adapter":"gsettings","schema":"org.gnome.desktop.interface","key":"cursor-size"},"gtk.text.scale":{"type":"number","min":0.5,"max":3,"scope":"GTK applications","label":"GTK text scale","adapter":"gsettings","schema":"org.gnome.desktop.interface","key":"text-scaling-factor"},"hypr.animations.enabled":{"type":"bool","scope":"Hyprland session","label":"Hyprland animations","adapter":"hyprctl","option":"animations:enabled"},"hypr.blur.enabled":{"type":"bool","scope":"Hyprland session","label":"Blur","adapter":"hyprctl","option":"decoration:blur:enabled"},"hypr.border_size":{"type":"int","min":0,"max":32,"scope":"Hyprland session","label":"Window border size","adapter":"hyprctl","option":"general:border_size"},"hypr.cursor.zoom_factor":{"type":"number","min":0.5,"max":3,"scope":"Hyprland compositor","label":"Cursor zoom","adapter":"hyprctl","option":"cursor:zoom_factor"},"hypr.dim_inactive":{"type":"bool","scope":"Hyprland session","label":"Inactive-window dimming","adapter":"hyprctl","option":"decoration:dim_inactive"},"hypr.dim_strength":{"type":"number","min":0,"max":1,"scope":"Hyprland session","label":"Inactive dim strength","adapter":"hyprctl","option":"decoration:dim_strength"},"hypr.shadow.enabled":{"type":"bool","scope":"Hyprland session","label":"Window shadows","adapter":"hyprctl","option":"decoration:shadow:enabled"},"input.repeat_delay":{"type":"int","min":100,"max":2000,"scope":"Hyprland keyboard input","label":"Keyboard repeat delay","adapter":"hyprctl","option":"input:repeat_delay"},"input.repeat_rate":{"type":"int","min":1,"max":100,"scope":"Hyprland keyboard input","label":"Keyboard repeat rate","adapter":"hyprctl","option":"input:repeat_rate"}}'
+MOCK_APPLY_COUNT=0
+
+die() {
+  printf 'accessctl: %s\n' "$*" >&2
+  return 1
+}
+
+json_error() {
+  local message="$1" code="${2:-1}" details="${3-}"
+  [[ -n "$details" ]] || details='{}'
+  jq -cn --arg message "$message" --argjson details "$details" \
+    '{ok:false,schemaVersion:1,error:$message,details:$details}'
+  return "$code"
+}
+
+json_ok() {
+  local body="${1-}"
+  [[ -n "$body" ]] || body='{}'
+  jq -cn --argjson body "$body" '$body | .ok = true | .schemaVersion = 1'
+}
+
+is_absolute() { [[ "${1:-}" == /* ]]; }
+
+has_unsafe_path_component() {
+  local path="$1"
+  [[ "$path" == *$'\n'* || "$path" == *$'\r'* ]] && return 0
+  [[ "$path" == */../* || "$path" == ../* || "$path" == */.. || "$path" == .. ]] && return 0
+  [[ "$path" == */./* || "$path" == ./* || "$path" == */. || "$path" == . ]] && return 0
+  return 1
+}
+
+normalize_root() {
+  local raw="$1" normalized
+  is_absolute "$raw" || { die "XDG path must be absolute"; return 1; }
+  has_unsafe_path_component "$raw" && { die "XDG path contains an unsafe component"; return 1; }
+  normalized=$(realpath -m -s -- "$raw" 2>/dev/null) || { die "cannot resolve XDG path"; return 1; }
+  is_absolute "$normalized" || { die "resolved XDG path is not absolute"; return 1; }
+  printf '%s\n' "$normalized"
+}
+
+symlink_component() {
+  local path="$1" current="/" part
+  local -a parts=()
+  IFS='/' read -r -a parts <<< "${path#/}"
+  for part in "${parts[@]}"; do
+    [[ -z "$part" ]] && continue
+    current="${current%/}/$part"
+    [[ -L "$current" ]] && return 0
+  done
+  return 1
+}
+
+ensure_dir() {
+  local dir="$1"
+  symlink_component "$dir" && { die "refusing symlink directory: $dir"; return 1; }
+  mkdir -p -- "$dir" 2>/dev/null || { die "cannot create state directory"; return 1; }
+  chmod 700 -- "$dir" 2>/dev/null || true
+}
+
+safe_file() {
+  local file="$1"
+  is_absolute "$file" || { die "state path is not absolute"; return 1; }
+  [[ ! -L "$file" ]] || { die "refusing symlink state file: $file"; return 1; }
+  symlink_component "$(dirname -- "$file")" && { die "refusing symlink state directory"; return 1; }
+  ensure_dir "$(dirname -- "$file")"
+}
+
+atomic_write() {
+  local file="$1" content="$2" dir tmp
+  safe_file "$file" || return 1
+  dir=$(dirname -- "$file")
+  tmp=$(mktemp "$dir/.accessctl.tmp.XXXXXX" 2>/dev/null) || { die "cannot create atomic state file"; return 1; }
+  chmod 600 -- "$tmp" 2>/dev/null || true
+  if ! printf '%s\n' "$content" > "$tmp"; then
+    rm -f -- "$tmp"
+    die "cannot write atomic state file"
+    return 1
+  fi
+  if ! mv -f -- "$tmp" "$file"; then
+    rm -f -- "$tmp"
+    die "cannot commit atomic state file"
+    return 1
+  fi
+  chmod 600 -- "$file" 2>/dev/null || true
+}
+
+remove_safe_file() {
+  local file="$1"
+  [[ ! -e "$file" && ! -L "$file" ]] && return 0
+  safe_file "$file" || return 1
+  rm -f -- "$file" 2>/dev/null || { die "cannot remove state file"; return 1; }
+}
+
+init_paths() {
+  local home="${HOME:-}"
+  is_absolute "$home" || { die "HOME must be absolute"; return 1; }
+  CONFIG_ROOT=$(normalize_root "${ACCESSCTL_CONFIG_HOME:-${XDG_CONFIG_HOME:-$home/.config}}") || return 1
+  STATE_ROOT=$(normalize_root "${ACCESSCTL_STATE_HOME:-${XDG_STATE_HOME:-$home/.local/state}}") || return 1
+  RUNTIME_ROOT=$(normalize_root "${ACCESSCTL_RUNTIME_HOME:-${XDG_RUNTIME_DIR:-/tmp}}") || return 1
+  PLUGIN_STATE_DIR="$STATE_ROOT/omarchy-access-profiles"
+  PLUGIN_CONFIG_DIR="$CONFIG_ROOT/omarchy-access-profiles"
+  STATE_FILE="$PLUGIN_STATE_DIR/state.json"
+  BASELINE_FILE="$PLUGIN_STATE_DIR/baseline.json"
+  PENDING_FILE="$PLUGIN_STATE_DIR/pending.json"
+  HISTORY_FILE="$PLUGIN_STATE_DIR/history.jsonl"
+  USER_PROFILES_FILE="$PLUGIN_CONFIG_DIR/profiles.json"
+  LOCK_FILE="$RUNTIME_ROOT/omarchy-access-profiles.lock"
+  ensure_dir "$PLUGIN_STATE_DIR" || return 1
+  ensure_dir "$PLUGIN_CONFIG_DIR" || return 1
+  safe_file "$STATE_FILE" || return 1
+  safe_file "$BASELINE_FILE" || return 1
+  safe_file "$PENDING_FILE" || return 1
+  safe_file "$HISTORY_FILE" || return 1
+  safe_file "$USER_PROFILES_FILE" || return 1
+  safe_file "$LOCK_FILE" || return 1
+}
+
+resolve_commands() {
+  HYPRCTL_BIN="${ACCESSCTL_HYPRCTL:-$(command -v hyprctl 2>/dev/null || true)}"
+  GSETTINGS_BIN="${ACCESSCTL_GSETTINGS:-$(command -v gsettings 2>/dev/null || true)}"
+  FLOCK_BIN="${ACCESSCTL_FLOCK:-$(command -v flock 2>/dev/null || true)}"
+}
+
+validate_profiles_json() {
+  local file="$1"
+  jq -e --argjson specs "$SETTING_SPECS" '
+    .schemaVersion == 1 and (.profiles | type == "array") and
+    (([.profiles[].id] | unique | length) == (.profiles | length)) and
+    all(.profiles[];
+      (.id | type == "string" and test("^[a-z0-9][a-z0-9-]{0,63}$")) and
+      (.name | type == "string" and length >= 1 and length <= 80) and
+      (.description | type == "string" and length <= 240) and
+      (.settings | type == "object") and
+      all(.settings | to_entries[];
+        . as $entry |
+        ($specs[$entry.key] != null) and
+        (if $specs[$entry.key].type == "bool" then ($entry.value | type == "boolean")
+         elif $specs[$entry.key].type == "int" then ($entry.value | type == "number" and isfinite and floor == . and . >= $specs[$entry.key].min and . <= $specs[$entry.key].max)
+         else ($entry.value | type == "number" and isfinite and . >= $specs[$entry.key].min and . <= $specs[$entry.key].max)
+         end)
+      )
+    )
+  ' "$file" >/dev/null 2>&1
+}
+
+load_profiles() {
+  [[ -f "$DEFAULT_PROFILES_FILE" ]] || { die "built-in profiles are missing"; return 1; }
+  validate_profiles_json "$DEFAULT_PROFILES_FILE" || { die "built-in profiles failed validation"; return 1; }
+  if [[ -e "$USER_PROFILES_FILE" ]]; then
+    validate_profiles_json "$USER_PROFILES_FILE" || { die "user profiles failed validation"; return 1; }
+    PROFILES_JSON=$(jq -c --argfile built "$DEFAULT_PROFILES_FILE" --argfile user "$USER_PROFILES_FILE" \
+      'if (([$built.profiles[].id] + [$user.profiles[].id]) | unique | length) != (($built.profiles + $user.profiles) | length) then error("duplicate profile id") else ($built.profiles + $user.profiles) end' 2>/dev/null) || { die "duplicate profile id"; return 1; }
+  else
+    PROFILES_JSON=$(jq -c '.profiles' "$DEFAULT_PROFILES_FILE" 2>/dev/null) || { die "cannot read profiles"; return 1; }
+  fi
+}
+
+profile_json() {
+  local id="$1"
+  [[ "$id" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || return 1
+  jq -c --arg id "$id" '[.[] | select(.id == $id)] | if length == 1 then .[0] else empty end' <<< "$PROFILES_JSON" 2>/dev/null
+}
+
+validate_operation_id() {
+  [[ "${1:-}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+validate_setting_id() {
+  jq -e --arg id "$1" 'has($id)' <<< "$SETTING_SPECS" >/dev/null 2>&1
+}
+
+setting_type() { jq -r --arg id "$1" '.[$id].type' <<< "$SETTING_SPECS"; }
+setting_scope() { jq -r --arg id "$1" '.[$id].scope' <<< "$SETTING_SPECS"; }
+setting_label() { jq -r --arg id "$1" '.[$id].label' <<< "$SETTING_SPECS"; }
+
+value_json_from_profile() {
+  jq -c --arg id "$1" '.settings[$id]' <<< "$2" 2>/dev/null
+}
+
+validate_value() {
+  local id="$1" value="$2"
+  jq -n -e --arg id "$id" --argjson value "$value" --argjson specs "$SETTING_SPECS" '
+    ($specs[$id] != null) and
+    (if $specs[$id].type == "bool" then ($value | type == "boolean")
+     elif $specs[$id].type == "int" then
+       (($value | type) == "number") and ($value | isfinite) and (($value | floor) == $value) and $value >= $specs[$id].min and $value <= $specs[$id].max
+     else
+       (($value | type) == "number") and ($value | isfinite) and $value >= $specs[$id].min and $value <= $specs[$id].max
+     end)
+  ' >/dev/null 2>&1
+}
+
+mock_enabled() { [[ -n "${ACCESSCTL_MOCK_DIR:-}" ]]; }
+
+mock_path() { printf '%s/%s\n' "$ACCESSCTL_MOCK_DIR" "$1"; }
+
+mock_unsupported() {
+  local id="$1" item
+  IFS=',' read -r -a items <<< "${ACCESSCTL_MOCK_UNSUPPORTED:-}"
+  for item in "${items[@]}"; do [[ "$item" == "$id" ]] && return 0; done
+  return 1
+}
+
+read_hypr_value() {
+  local id="$1" option type raw value
+  option=$(jq -r --arg id "$id" '.[$id].option' <<< "$SETTING_SPECS")
+  type=$(setting_type "$id")
+  raw=$("$HYPRCTL_BIN" getoption "$option" -j 2>/dev/null) || return 11
+  value=$(jq -c --arg type "$type" '
+    if $type == "bool" then
+      if .int? != null then (.int == 1) elif .bool? != null then .bool
+      elif .str? != null and (.str == "true" or .str == "false") then .str == "true" else error("no bool") end
+    elif $type == "int" then
+      if .int? != null then .int elif .float? != null and (.float | floor == .) then .float | floor
+      elif .str? != null then (.str | tonumber | floor) else error("no int") end
+    else
+      if .float? != null then .float elif .int? != null then .int
+      elif .str? != null then (.str | tonumber) else error("no number") end
+    end
+  ' <<< "$raw" 2>/dev/null) || return 12
+  validate_value "$id" "$value" || return 12
+  printf '%s\n' "$value"
+}
+
+read_gsettings_value() {
+  local id="$1" schema key type raw value
+  schema=$(jq -r --arg id "$id" '.[$id].schema' <<< "$SETTING_SPECS")
+  key=$(jq -r --arg id "$id" '.[$id].key' <<< "$SETTING_SPECS")
+  type=$(setting_type "$id")
+  [[ -n "$GSETTINGS_BIN" ]] || return 11
+  "$GSETTINGS_BIN" writable "$schema" "$key" 2>/dev/null | grep -qx true || return 10
+  raw=$("$GSETTINGS_BIN" get "$schema" "$key" 2>/dev/null) || return 11
+  raw="${raw##* }"
+  if [[ "$type" == bool ]]; then
+    [[ "$raw" == true || "$raw" == false ]] || return 12
+    value="$raw"
+  else
+    value=$(jq -cn --arg raw "$raw" '$raw | tonumber' 2>/dev/null) || return 12
+  fi
+  validate_value "$id" "$value" || return 12
+  printf '%s\n' "$value"
+}
+
+read_setting() {
+  local id="$1" file value adapter
+  READ_STATUS=supported
+  READ_ERROR=""
+  READ_VALUE=""
+  validate_setting_id "$id" || { READ_STATUS=error; READ_ERROR="unknown setting"; return 1; }
+  if mock_enabled; then
+    mock_unsupported "$id" && { READ_STATUS=unsupported; READ_ERROR="mock capability disabled"; return 1; }
+    file=$(mock_path values.json)
+    [[ -f "$file" ]] || { READ_STATUS=unavailable; READ_ERROR="mock values are missing"; return 1; }
+    value=$(jq -c --arg id "$id" 'if has($id) then .[$id] else error("missing value") end' "$file" 2>/dev/null) || { READ_STATUS=unavailable; READ_ERROR="mock value is missing"; return 1; }
+    validate_value "$id" "$value" || { READ_STATUS=error; READ_ERROR="mock value failed validation"; return 1; }
+    READ_VALUE="$value"
+    printf '%s\n' "$value"
+    return 0
+  fi
+  adapter=$(jq -r --arg id "$id" '.[$id].adapter' <<< "$SETTING_SPECS")
+  if [[ "$adapter" == hyprctl ]]; then
+    [[ -n "$HYPRCTL_BIN" ]] || { READ_STATUS=unavailable; READ_ERROR="hyprctl is not installed"; return 1; }
+    if value=$(read_hypr_value "$id"); then READ_VALUE="$value"; else case "$?" in 10) READ_STATUS=unsupported; READ_ERROR="Hyprland option is unavailable";; 11) READ_STATUS=unavailable; READ_ERROR="Hyprland option could not be read";; *) READ_STATUS=error; READ_ERROR="Hyprland returned an unexpected value";; esac; return 1; fi
+  else
+    if value=$(read_gsettings_value "$id"); then READ_VALUE="$value"; else case "$?" in 10) READ_STATUS=unsupported; READ_ERROR="GTK schema key is unavailable";; 11) READ_STATUS=unavailable; READ_ERROR="GTK setting could not be read";; *) READ_STATUS=error; READ_ERROR="GTK returned an unexpected value";; esac; return 1; fi
+  fi
+}
+
+format_value() {
+  local id="$1" value="$2" type
+  type=$(setting_type "$id")
+  if [[ "$type" == bool ]]; then jq -r 'if . then "On" else "Off" end' <<< "$value"; else jq -r -c '.' <<< "$value"; fi
+}
+
+apply_setting() {
+  local id="$1" value="$2" adapter schema key option rendered
+  validate_value "$id" "$value" || { APPLY_ERROR="value rejected"; return 1; }
+  if mock_enabled; then
+    local count=$((MOCK_APPLY_COUNT + 1))
+    MOCK_APPLY_COUNT=$count
+    if [[ -n "${ACCESSCTL_MOCK_FAIL_AFTER:-}" && "$count" -eq "$ACCESSCTL_MOCK_FAIL_AFTER" ]]; then
+      APPLY_ERROR="mock failure at apply step $count"
+      return 1
+    fi
+    local file tmp
+    file=$(mock_path values.json)
+    tmp=$(mktemp "$(dirname -- "$file")/.mock-values.XXXXXX") || { APPLY_ERROR="mock write failed"; return 1; }
+    if ! jq -c --arg id "$id" --argjson value "$value" '.[$id] = $value' "$file" > "$tmp" 2>/dev/null; then
+      rm -f -- "$tmp"; APPLY_ERROR="mock write failed"; return 1
+    fi
+    mv -f -- "$tmp" "$file" || { rm -f -- "$tmp"; APPLY_ERROR="mock write failed"; return 1; }
+    return 0
+  fi
+  adapter=$(jq -r --arg id "$id" '.[$id].adapter' <<< "$SETTING_SPECS")
+  rendered=$(format_value "$id" "$value")
+  if [[ "$adapter" == hyprctl ]]; then
+    option=$(jq -r --arg id "$id" '.[$id].option' <<< "$SETTING_SPECS")
+    "$HYPRCTL_BIN" keyword "$option" "$rendered" >/dev/null 2>&1 || { APPLY_ERROR="hyprctl rejected the setting"; return 1; }
+  else
+    schema=$(jq -r --arg id "$id" '.[$id].schema' <<< "$SETTING_SPECS")
+    key=$(jq -r --arg id "$id" '.[$id].key' <<< "$SETTING_SPECS")
+    "$GSETTINGS_BIN" set "$schema" "$key" "$rendered" >/dev/null 2>&1 || { APPLY_ERROR="gsettings rejected the setting"; return 1; }
+  fi
+}
+
+equal_values() {
+  jq -n -e --argjson a "$1" --argjson b "$2" 'if ($a|type) == "number" and ($b|type) == "number" then (($a - $b) | fabs) < 0.0001 else $a == $b end' >/dev/null 2>&1
+}
+
+read_state_file() {
+  local file="$1" default="$2"
+  if [[ ! -e "$file" ]]; then printf '%s\n' "$default"; return 0; fi
+  safe_file "$file" || return 1
+  jq -e 'type == "object" and .schemaVersion == 1' "$file" >/dev/null 2>&1 || { die "malformed state file: $file"; return 1; }
+  jq -c '.' "$file"
+}
+
+default_state() { jq -cn '{schemaVersion:1,activeProfile:null,lastApplied:{},preview:null,conflicts:[],lastOperationId:null}'; }
+
+load_state() {
+  STATE_JSON=$(read_state_file "$STATE_FILE" "$(default_state)") || return 1
+  if [[ -f "$BASELINE_FILE" ]]; then
+    BASELINE_JSON=$(read_state_file "$BASELINE_FILE" '{}') || return 1
+    jq -e 'type == "object" and .schemaVersion == 1 and (.values | type == "object")' <<< "$BASELINE_JSON" >/dev/null 2>&1 || { die "malformed baseline"; return 1; }
+  else
+    BASELINE_JSON='null'
+  fi
+}
+
+save_state() { atomic_write "$STATE_FILE" "$STATE_JSON"; }
+
+append_history() {
+  local event="$1" existing combined trimmed
+  [[ -f "$HISTORY_FILE" ]] && existing=$(<"$HISTORY_FILE") || existing=""
+  combined="$existing${existing:+$'\n'}$event"
+  trimmed=$(printf '%s\n' "$combined" | tail -n 50 | head -c 262144)
+  atomic_write "$HISTORY_FILE" "$trimmed"
+}
+
+write_pending() { atomic_write "$PENDING_FILE" "$1"; }
+clear_pending() { remove_safe_file "$PENDING_FILE"; }
+
+operation_seen() {
+  local operation="$1"
+  [[ -n "$operation" ]] && jq -e --arg op "$operation" '.lastOperationId == $op' <<< "$STATE_JSON" >/dev/null 2>&1
+}
+
+hyprland_version() {
+  if mock_enabled; then printf 'mock-hyprland\n'; return; fi
+  [[ -n "$HYPRCTL_BIN" ]] || { printf 'unavailable\n'; return; }
+  "$HYPRCTL_BIN" version 2>/dev/null | head -n 1 | tr -d '\r' || printf 'unavailable\n'
+}
+
+capture_baseline() {
+  local source="${1:-}" values='{}' id value
+  local -a ids=()
+  [[ "$BASELINE_JSON" == null ]] || return 0
+  if [[ -n "$source" ]]; then
+    values="$source"
+  else
+    mapfile -t ids < <(jq -r 'keys[]' <<< "$SETTING_SPECS")
+    for id in "${ids[@]}"; do
+      read_setting "$id" >/dev/null || continue
+      value="$READ_VALUE"
+      values=$(jq -c --arg id "$id" --argjson value "$value" '.[$id] = $value' <<< "$values")
+    done
+  fi
+  BASELINE_JSON=$(jq -cn --argjson values "$values" --arg version "$(hyprland_version)" \
+    '{schemaVersion:1,capturedAt:(now|floor),hyprlandVersion:$version,values:$values}')
+  atomic_write "$BASELINE_FILE" "$BASELINE_JSON"
+}
+
+requested_ids() { jq -r '.settings | keys[]' <<< "$1"; }
+
+target_for_profile() {
+  local profile="$1" supported="$2" target='{}' id value
+  local -a ids=()
+  mapfile -t ids < <(requested_ids "$profile")
+  for id in "${ids[@]}"; do
+    jq -e --arg id "$id" 'has($id)' <<< "$supported" >/dev/null 2>&1 || continue
+    value=$(value_json_from_profile "$id" "$profile")
+    target=$(jq -c --arg id "$id" --argjson value "$value" '.[$id]=$value' <<< "$target")
+  done
+  printf '%s\n' "$target"
+}
+
+build_plan() {
+  local profile="$1" changes='[]' warnings='[]' id target current status reason
+  local -a ids=()
+  mapfile -t ids < <(requested_ids "$profile")
+  for id in "${ids[@]}"; do
+    target=$(value_json_from_profile "$id" "$profile")
+    if read_setting "$id" >/dev/null; then
+      current="$READ_VALUE"
+      if equal_values "$current" "$target"; then status=unchanged; else status=ready; fi
+      reason=""
+    else
+      status="$READ_STATUS"; reason="$READ_ERROR"; current=null
+      warnings=$(jq -c --arg id "$id" --arg reason "$reason" '. + [{id:$id,reason:$reason}]' <<< "$warnings")
+    fi
+    changes=$(jq -c --arg id "$id" --arg label "$(setting_label "$id")" --arg scope "$(setting_scope "$id")" \
+      --arg status "$status" --arg reason "$reason" --argjson from "$current" --argjson to "$target" \
+      '. + [{id:$id,label:$label,scope:$scope,from:$from,to:$to,status:$status,reason:$reason}]' <<< "$changes")
+  done
+  jq -cn --argjson changes "$changes" --argjson warnings "$warnings" --arg profile "$(jq -r '.id' <<< "$profile")" \
+    '{changes:$changes,warnings:$warnings,profileId:$profile}'
+}
+
+capabilities_json() {
+  local caps='[]' id value status reason current
+  local -a ids=()
+  mapfile -t ids < <(jq -r 'keys[]' <<< "$SETTING_SPECS")
+  for id in "${ids[@]}"; do
+    if read_setting "$id" >/dev/null; then current="$READ_VALUE"; status=supported; reason=""; else status="$READ_STATUS"; reason="$READ_ERROR"; current=null; fi
+    caps=$(jq -c --arg id "$id" --arg label "$(setting_label "$id")" --arg scope "$(setting_scope "$id")" \
+      --arg status "$status" --arg reason "$reason" --argjson current "$current" \
+      '. + [{id:$id,label:$label,scope:$scope,status:$status,current:$current,reason:$reason}]' <<< "$caps")
+  done
+  printf '%s\n' "$caps"
+}
+
+rollback_applied() {
+  local before="$1" applied="$2" rid rvalue
+  ROLLBACK_OK=true
+  while IFS= read -r rid; do
+    rvalue=$(jq -c --arg id "$rid" '.[$id]' <<< "$before")
+    apply_setting "$rid" "$rvalue" || ROLLBACK_OK=false
+  done < <(jq -r 'reverse[]' <<< "$applied")
+}
+
+apply_snapshot_transaction() {
+  local before="$1" target="$2" operation="$3" kind="$4" profile_id="$5" applied='[]' id value current
+  local -a ids=()
+  local pending
+  pending=$(jq -cn --arg op "$operation" --arg kind "$kind" --arg profile "$profile_id" --argjson before "$before" --argjson target "$target" \
+    '{schemaVersion:1,operationId:$op,kind:$kind,profileId:$profile,before:$before,target:$target,applied:[]}')
+  write_pending "$pending" || return 1
+  mapfile -t ids < <(jq -r 'keys[]' <<< "$target")
+  for id in "${ids[@]}"; do
+    value=$(jq -c --arg id "$id" '.[$id]' <<< "$target")
+    applied=$(jq -c --arg id "$id" '. + [$id]' <<< "$applied")
+    pending=$(jq -c --argjson applied "$applied" '.applied = $applied' <<< "$pending")
+    write_pending "$pending" || { TX_ERROR="could not update pending journal"; return 1; }
+    apply_setting "$id" "$value" || {
+      rollback_applied "$before" "$applied"
+      if [[ "$ROLLBACK_OK" == true ]]; then clear_pending; else write_pending "$(jq -c --arg phase rollback-failed '. + {phase:$phase}' <<< "$pending")"; fi
+      TX_ERROR="apply failed for $id: $APPLY_ERROR"
+      [[ "$ROLLBACK_OK" == true ]] && TX_ERROR="$TX_ERROR; rollback verified"
+      return 1
+    }
+    read_setting "$id" >/dev/null || {
+      rollback_applied "$before" "$applied"
+      if [[ "$ROLLBACK_OK" == true ]]; then clear_pending; else write_pending "$(jq -c --arg phase rollback-failed '. + {phase:$phase}' <<< "$pending")"; fi
+      TX_ERROR="could not read back $id"
+      [[ "$ROLLBACK_OK" == true ]] && TX_ERROR="$TX_ERROR; rollback verified"
+      return 1
+    }
+    current="$READ_VALUE"
+    if ! equal_values "$current" "$value"; then
+      rollback_applied "$before" "$applied"
+      if [[ "$ROLLBACK_OK" == true ]]; then clear_pending; else write_pending "$(jq -c --arg phase rollback-failed '. + {phase:$phase}' <<< "$pending")"; fi
+      TX_ERROR="read-back verification failed for $id"
+      [[ "$ROLLBACK_OK" == true ]] && TX_ERROR="$TX_ERROR; rollback verified"
+      return 1
+    fi
+  done
+  clear_pending || { TX_ERROR="could not clear pending journal"; return 1; }
+  TX_APPLIED="$applied"
+  return 0
+}
+
+snapshot_for_profile() {
+  local profile="$1" snapshot='{}' id value
+  local -a ids=()
+  mapfile -t ids < <(requested_ids "$profile")
+  for id in "${ids[@]}"; do
+    read_setting "$id" >/dev/null || {
+      [[ "$READ_STATUS" == unsupported || "$READ_STATUS" == unavailable ]] && continue
+      SNAPSHOT_ERROR="$READ_ERROR"
+      return 1
+    }
+    value="$READ_VALUE"
+    snapshot=$(jq -c --arg id "$id" --argjson value "$value" '.[$id] = $value' <<< "$snapshot")
+  done
+  printf '%s\n' "$snapshot"
+}
+
+complete_restore() {
+  local operation="$1"
+  STATE_JSON=$(jq -c --arg op "$operation" '.activeProfile = null | .lastApplied = {} | .preview = null | .conflicts = [] | .lastOperationId = $op' <<< "$STATE_JSON")
+  save_state || return 1
+  remove_safe_file "$BASELINE_FILE" || return 1
+  BASELINE_JSON=null
+  append_history "$(jq -cn --arg op "$operation" '{at:(now|floor),operationId:$op,action:"restore",result:"ok"}')" || return 1
+}
+
+cmd_capabilities() {
+  printf '%s\n' "$(json_ok "$(jq -cn --argjson capabilities "$(capabilities_json)" '{capabilities:$capabilities,hyprlandVersion:"'"$(hyprland_version | sed 's/"/\\"/g')"'"}')")"
+}
+
+cmd_list_profiles() { jq -cn --argjson profiles "$PROFILES_JSON" '{ok:true,schemaVersion:1,profiles:$profiles}'; }
+
+cmd_status() {
+  local caps values='{}' id value
+  local -a ids=()
+  caps=$(capabilities_json)
+  mapfile -t ids < <(jq -r 'keys[]' <<< "$SETTING_SPECS")
+  for id in "${ids[@]}"; do
+    read_setting "$id" >/dev/null || continue
+    value="$READ_VALUE"
+    values=$(jq -c --arg id "$id" --argjson value "$value" '.[$id]=$value' <<< "$values")
+  done
+  jq -cn --argjson state "$STATE_JSON" --argjson caps "$caps" --argjson values "$values" --arg baseline "$([[ "$BASELINE_JSON" == null ]] && echo false || echo true)" \
+    '{ok:true,schemaVersion:1,activeProfile:$state.activeProfile,preview:$state.preview,conflicts:($state.conflicts // []),baselineCaptured:($baseline == "true"),values:$values,capabilities:$caps}'
+}
+
+cmd_plan() {
+  local profile
+  profile=$(profile_json "$1") || { json_error "unknown profile" 2; return; }
+  [[ -n "$profile" ]] || { json_error "unknown profile" 2; return; }
+  local plan; plan=$(build_plan "$profile")
+  json_ok "$plan"
+}
+
+cmd_apply() {
+  local profile_id="$1" operation="$2" profile before target
+  profile=$(profile_json "$profile_id") || { json_error "unknown profile" 2; return; }
+  [[ -n "$profile" ]] || { json_error "unknown profile" 2; return; }
+  validate_operation_id "$operation" || { json_error "invalid operation id" 2; return; }
+  operation_seen "$operation" && { json_ok "$(jq -cn --arg op "$operation" --arg profile "$profile_id" '{operationId:$op,profileId:$profile,idempotent:true}')"; return; }
+  before=$(snapshot_for_profile "$profile") || { json_error "could not read current values" 2 "$(jq -cn --arg reason "${SNAPSHOT_ERROR:-$READ_ERROR}" '{reason:$reason}')"; return; }
+  target=$(target_for_profile "$profile" "$before")
+  capture_baseline "$before" || { json_error "could not capture baseline" 2; return; }
+  apply_snapshot_transaction "$before" "$target" "$operation" apply "$profile_id" || { json_error "${TX_ERROR:-apply failed}" 2; return; }
+  STATE_JSON=$(jq -c --arg profile "$profile_id" --arg op "$operation" --argjson applied "$TX_APPLIED" \
+    --argjson target "$target" '.activeProfile=$profile | .lastApplied = $target | .preview=null | .conflicts=[] | .lastOperationId=$op' <<< "$STATE_JSON")
+  save_state || { json_error "settings applied but state persistence failed" 2; return; }
+  append_history "$(jq -cn --arg op "$operation" --arg profile "$profile_id" '{at:(now|floor),operationId:$op,action:"apply",profileId:$profile,result:"ok"}')" || true
+  json_ok "$(jq -cn --arg op "$operation" --arg profile "$profile_id" --argjson changes "$target" '{operationId:$op,profileId:$profile,changes:$changes}')"
+}
+
+cmd_preview() {
+  local profile_id="$1" seconds="$2" operation="$3" profile before target deadline
+  [[ "$seconds" =~ ^[1-9][0-9]{0,3}$ && "$seconds" -le 300 ]] || { json_error "preview duration must be 1-300 seconds" 2; return; }
+  profile=$(profile_json "$profile_id") || { json_error "unknown profile" 2; return; }
+  [[ -n "$profile" ]] || { json_error "unknown profile" 2; return; }
+  validate_operation_id "$operation" || { json_error "invalid operation id" 2; return; }
+  operation_seen "$operation" && { json_ok "$(jq -cn --arg op "$operation" '{operationId:$op,idempotent:true}')"; return; }
+  before=$(snapshot_for_profile "$profile") || { json_error "could not read current values" 2; return; }
+  target=$(target_for_profile "$profile" "$before")
+  capture_baseline "$before" || { json_error "could not capture baseline" 2; return; }
+  deadline=$(( $(date +%s) + seconds ))
+  apply_snapshot_transaction "$before" "$target" "$operation" preview "$profile_id" || { json_error "${TX_ERROR:-preview failed}" 2; return; }
+  STATE_JSON=$(jq -c --arg profile "$profile_id" --arg op "$operation" --argjson before "$before" --argjson target "$target" --argjson deadline "$deadline" \
+    '.preview={operationId:$op,profileId:$profile,startedAt:(now|floor),deadline:$deadline,before:$before,lastApplied:$target,previousActiveProfile:.activeProfile,previousLastApplied:.lastApplied} | .lastOperationId=$op' <<< "$STATE_JSON")
+  save_state || { json_error "preview applied but state persistence failed" 2; return; }
+  json_ok "$(jq -cn --arg op "$operation" --arg profile "$profile_id" --argjson deadline "$deadline" --argjson changes "$target" '{operationId:$op,profileId:$profile,deadline:$deadline,changes:$changes}')"
+}
+
+cmd_keep_preview() {
+  local operation="$1" preview
+  validate_operation_id "$operation" || { json_error "invalid operation id" 2; return; }
+  preview=$(jq -c '.preview // empty' <<< "$STATE_JSON")
+  [[ -n "$preview" ]] || { json_error "no active preview" 2; return; }
+  jq -e --arg op "$operation" '.operationId == $op' <<< "$preview" >/dev/null 2>&1 || { json_error "operation id does not match preview" 2; return; }
+  STATE_JSON=$(jq -c --arg op "$operation" '.activeProfile=.preview.profileId | .lastApplied=.preview.lastApplied | .preview=null | .conflicts=[] | .lastOperationId=$op' <<< "$STATE_JSON")
+  save_state || { json_error "could not persist kept preview" 2; return; }
+  append_history "$(jq -cn --arg op "$operation" '{at:(now|floor),operationId:$op,action:"keep-preview",result:"ok"}')" || true
+  json_ok "$(jq -cn --arg op "$operation" '{operationId:$op,preview:null}')"
+}
+
+cmd_cancel_preview() {
+  local operation="$1" preview before id value
+  local -a ids=()
+  validate_operation_id "$operation" || { json_error "invalid operation id" 2; return; }
+  preview=$(jq -c '.preview // empty' <<< "$STATE_JSON")
+  [[ -n "$preview" ]] || { json_error "no active preview" 2; return; }
+  jq -e --arg op "$operation" '.operationId == $op' <<< "$preview" >/dev/null 2>&1 || { json_error "operation id does not match preview" 2; return; }
+  before=$(jq -c '.before' <<< "$preview")
+  mapfile -t ids < <(jq -r 'keys[]' <<< "$before")
+  for id in "${ids[@]}"; do
+    value=$(jq -c --arg id "$id" '.[$id]' <<< "$before")
+    apply_setting "$id" "$value" || { json_error "preview rollback failed" 2; return; }
+  done
+  STATE_JSON=$(jq -c --arg op "$operation" '.activeProfile=.preview.previousActiveProfile | .lastApplied=.preview.previousLastApplied | .preview=null | .lastOperationId=$op' <<< "$STATE_JSON")
+  save_state || { json_error "preview reverted but state persistence failed" 2; return; }
+  append_history "$(jq -cn --arg op "$operation" '{at:(now|floor),operationId:$op,action:"cancel-preview",result:"ok"}')" || true
+  json_ok "$(jq -cn --arg op "$operation" '{operationId:$op,preview:null}')"
+}
+
+cmd_restore() {
+  local operation="$1" conflicts='[]' restore='{}' id baseline current last
+  local -a ids=()
+  validate_operation_id "$operation" || { json_error "invalid operation id" 2; return; }
+  [[ "$BASELINE_JSON" != null ]] || { json_ok "$(jq -cn '{message:"No Access baseline is stored."}')"; return; }
+  mapfile -t ids < <(jq -r '.values | keys[]' <<< "$BASELINE_JSON")
+  for id in "${ids[@]}"; do
+    baseline=$(jq -c --arg id "$id" '.values[$id]' <<< "$BASELINE_JSON")
+    read_setting "$id" >/dev/null || { json_error "cannot read managed setting" 2 "$(jq -cn --arg id "$id" --arg reason "$READ_ERROR" '{id:$id,reason:$reason}')"; return; }
+    current="$READ_VALUE"
+    last=$(jq -c --arg id "$id" '.lastApplied[$id] // null' <<< "$STATE_JSON")
+    if [[ "$last" == null ]] || equal_values "$current" "$last"; then
+      restore=$(jq -c --arg id "$id" --argjson value "$baseline" '.[$id]=$value' <<< "$restore")
+    elif equal_values "$current" "$baseline"; then
+      :
+    else
+      conflicts=$(jq -c --arg id "$id" --argjson baseline "$baseline" --argjson current "$current" --argjson last "$last" \
+        '. + [{id:$id,baseline:$baseline,current:$current,lastApplied:$last,label:""}]' <<< "$conflicts")
+    fi
+  done
+  conflicts=$(jq -c --argjson specs "$SETTING_SPECS" 'map(.label = $specs[.id].label)' <<< "$conflicts")
+  if [[ "$conflicts" != '[]' ]]; then
+    STATE_JSON=$(jq -c --argjson conflicts "$conflicts" '.conflicts=$conflicts' <<< "$STATE_JSON")
+    save_state || true
+    json_error "external-drift" 2 "$(jq -cn --argjson conflicts "$conflicts" '{conflicts:$conflicts}')"
+    return
+  fi
+  mapfile -t ids < <(jq -r 'keys[]' <<< "$restore")
+  for id in "${ids[@]}"; do
+    local value; value=$(jq -c --arg id "$id" '.[$id]' <<< "$restore")
+    apply_setting "$id" "$value" || { json_error "restore failed" 2 "$(jq -cn --arg id "$id" --arg reason "$APPLY_ERROR" '{id:$id,reason:$reason}')"; return; }
+    read_setting "$id" >/dev/null || { json_error "restore read-back failed" 2; return; }
+    current="$READ_VALUE"
+    equal_values "$current" "$value" || { json_error "restore verification failed" 2; return; }
+  done
+  complete_restore "$operation" || { json_error "settings restored but state cleanup failed" 2; return; }
+  json_ok "$(jq -cn --arg op "$operation" --argjson changes "$restore" '{operationId:$op,changes:$changes,activeProfile:null}')"
+}
+
+cmd_resolve_conflict() {
+  local id="$1" mode="$2" conflict target current
+  validate_setting_id "$id" || { json_error "unknown setting" 2; return; }
+  conflict=$(jq -c --arg id "$id" '[.conflicts[]? | select(.id == $id)] | if length == 1 then .[0] else empty end' <<< "$STATE_JSON")
+  [[ -n "$conflict" ]] || { json_error "conflict not found" 2; return; }
+  if [[ "$mode" == keep ]]; then
+    target=$(jq -c '.current' <<< "$conflict")
+    STATE_JSON=$(jq -c --arg id "$id" 'del(.lastApplied[$id]) | .conflicts |= map(select(.id != $id))' <<< "$STATE_JSON")
+  else
+    target=$(jq -c '.baseline' <<< "$conflict")
+    apply_setting "$id" "$target" || { json_error "conflict restore failed" 2; return; }
+    read_setting "$id" >/dev/null || { json_error "conflict restore read-back failed" 2; return; }
+    current="$READ_VALUE"
+    equal_values "$current" "$target" || { json_error "conflict restore verification failed" 2; return; }
+    STATE_JSON=$(jq -c --arg id "$id" 'del(.conflicts[] | select(.id == $id))' <<< "$STATE_JSON")
+  fi
+  if [[ "$(jq '.conflicts | length' <<< "$STATE_JSON")" == 0 ]]; then
+    complete_restore "$(jq -r '.lastOperationId // "00000000-0000-0000-0000-000000000000"' <<< "$STATE_JSON")" || { json_error "state cleanup failed" 2; return; }
+  else
+    save_state || { json_error "could not persist conflict resolution" 2; return; }
+  fi
+  json_ok "$(jq -cn --arg id "$id" --arg resolution "$mode" '{settingId:$id,resolution:$resolution}')"
+}
+
+cmd_recover() {
+  local pending phase before id value preview deadline now
+  local -a ids=()
+  if [[ -f "$PENDING_FILE" ]]; then
+    pending=$(read_state_file "$PENDING_FILE" '{}') || { json_error "pending journal is malformed" 2; return; }
+    before=$(jq -c '.before' <<< "$pending")
+    mapfile -t ids < <(jq -r 'keys[]' <<< "$before")
+    for id in "${ids[@]}"; do
+      value=$(jq -c --arg id "$id" '.[$id]' <<< "$before")
+      apply_setting "$id" "$value" || { json_error "recovery rollback failed" 2 "$(jq -cn --arg id "$id" '{id:$id}')"; return; }
+    done
+    clear_pending || { json_error "recovered settings but journal cleanup failed" 2; return; }
+  fi
+  preview=$(jq -c '.preview // empty' <<< "$STATE_JSON")
+  if [[ -n "$preview" ]]; then
+    deadline=$(jq -r '.deadline // 0' <<< "$preview"); now=$(date +%s)
+    if [[ "$deadline" =~ ^[0-9]+$ && "$deadline" -le "$now" ]]; then
+      before=$(jq -c '.before' <<< "$preview")
+      mapfile -t ids < <(jq -r 'keys[]' <<< "$before")
+      for id in "${ids[@]}"; do
+        value=$(jq -c --arg id "$id" '.[$id]' <<< "$before")
+        apply_setting "$id" "$value" || { json_error "expired preview rollback failed" 2; return; }
+      done
+      STATE_JSON=$(jq -c '.activeProfile=.preview.previousActiveProfile | .lastApplied=.preview.previousLastApplied | .preview=null' <<< "$STATE_JSON")
+      save_state || { json_error "preview recovered but state persistence failed" 2; return; }
+      append_history "$(jq -cn '{at:(now|floor),action:"recover-preview",result:"ok"}')" || true
+      json_ok '{recoveredPreview:true}'
+      return
+    fi
+  fi
+  json_ok '{recovered:false}'
+}
+
+cmd_export_diagnostics() {
+  local caps
+  caps=$(capabilities_json)
+  jq -cn --argjson caps "$caps" --arg active "$(jq -r '.activeProfile // ""' <<< "$STATE_JSON")" \
+    --argjson baseline "$(jq -cn --argjson value "$([[ "$BASELINE_JSON" == null ]] && echo false || echo true)" '$value')" \
+    '{ok:true,schemaVersion:1,pluginVersion:"1.0.0",activeProfile:$active,baselineParsed:$baseline,capabilities:$caps,notes:["No usernames, home paths, window titles, command history, or application content are included."]}'
+}
+
+main() {
+  local command="${1:-}"; shift || true
+  init_paths || { json_error "unsafe or unavailable state paths" 2; return; }
+  resolve_commands
+  load_profiles || { json_error "profile data is invalid" 2; return; }
+  load_state || { json_error "state is malformed; no mutation was performed" 2; return; }
+  case "$command" in
+    capabilities) cmd_capabilities ;;
+    status) cmd_status ;;
+    list-profiles) cmd_list_profiles ;;
+    plan) if [[ $# -eq 1 ]]; then cmd_plan "$1"; else json_error "usage: plan <profile-id>" 2; fi ;;
+    apply) if [[ $# -eq 3 && "$2" == --operation-id ]]; then cmd_apply "$1" "$3"; else json_error "usage: apply <profile-id> --operation-id <uuid>" 2; fi ;;
+    preview) if [[ $# -eq 5 && "$2" == --seconds && "$4" == --operation-id ]]; then cmd_preview "$1" "$3" "$5"; else json_error "usage: preview <profile-id> --seconds <n> --operation-id <uuid>" 2; fi ;;
+    keep-preview) if [[ $# -eq 2 && "$1" == --operation-id ]]; then cmd_keep_preview "$2"; else json_error "usage: keep-preview --operation-id <uuid>" 2; fi ;;
+    cancel-preview) if [[ $# -eq 2 && "$1" == --operation-id ]]; then cmd_cancel_preview "$2"; else json_error "usage: cancel-preview --operation-id <uuid>" 2; fi ;;
+    restore) if [[ $# -eq 2 && "$1" == --operation-id ]]; then cmd_restore "$2"; else json_error "usage: restore --operation-id <uuid>" 2; fi ;;
+    resolve-conflict) if [[ $# -eq 2 && "$2" == --keep-external ]]; then cmd_resolve_conflict "$1" keep; elif [[ $# -eq 2 && "$2" == --restore-baseline ]]; then cmd_resolve_conflict "$1" restore; else json_error "usage: resolve-conflict <setting-id> --keep-external|--restore-baseline" 2; fi ;;
+    recover) if [[ $# -eq 0 ]]; then cmd_recover; else json_error "usage: recover" 2; fi ;;
+    export-diagnostics) if [[ $# -eq 0 ]]; then cmd_export_diagnostics; else json_error "usage: export-diagnostics" 2; fi ;;
+    *) json_error "unknown command" 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  # A short lock keeps duplicate monitor widgets from mutating settings at
+  # the same time. Read-only calls still take the same lock so their plans do
+  # not race a concurrent apply.
+  if ! init_paths 2>/dev/null; then json_error "unsafe or unavailable state paths" 2; exit 2; fi
+  resolve_commands
+  if [[ -z "$FLOCK_BIN" ]]; then json_error "flock is unavailable" 2; exit 2; fi
+  exec 9>"$LOCK_FILE" || { json_error "cannot open state lock" 2; exit 2; }
+  if ! "$FLOCK_BIN" -w 2 9; then json_error "another Access operation is in progress" 2; exit 2; fi
+  main "$@"
+fi
