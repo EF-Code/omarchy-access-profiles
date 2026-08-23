@@ -40,7 +40,9 @@ Item {
       activeProfile = String(response.activeProfile || "")
       if (startupPhase) {
         startupPhase = false
-        if (activeProfile !== "") run(["apply", activeProfile, "--operation-id", operationId()], "reapply")
+        var conflicts = Array.isArray(response.conflicts) ? response.conflicts : []
+        if (activeProfile !== "" && !response.preview && conflicts.length === 0)
+          run(["apply", activeProfile, "--operation-id", operationId()], "reapply")
       }
     }
   }

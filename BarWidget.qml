@@ -26,10 +26,6 @@ BarWidget {
   function closeForPopoutSwitch() { if (panelLoader.item) panelLoader.item.closeForPopoutSwitch() }
   function refresh() { if (panelLoader.item && panelLoader.item.refresh) panelLoader.item.refresh() }
   function applyProfile(profileId) { if (panelLoader.item) panelLoader.item.applyProfile(String(profileId || "")) }
-  function broadcastApplyProfile(profileId) {
-    var items = root.bar && typeof root.bar.moduleWidgets === "function" ? root.bar.moduleWidgets(root.moduleName) : [root]
-    for (var i = 0; i < items.length; i++) if (items[i] && items[i].applyProfile) items[i].applyProfile(profileId)
-  }
   function requestRestore() { if (panelLoader.item) panelLoader.item.requestRestore() }
   function restore() { root.requestRestore() }
 
@@ -58,7 +54,7 @@ BarWidget {
     function hide() { root.close() }
     function toggle() { root.toggle() }
     function refresh() { root.broadcast("refresh") }
-    function applyProfile(profileId: string) { root.broadcastApplyProfile(profileId) }
+    function applyProfile(profileId: string) { root.applyProfile(profileId) }
     function restore() { root.broadcast("requestRestore") }
   }
 
