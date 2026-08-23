@@ -23,7 +23,7 @@ teardown() { rm -rf "$TEST_ROOT"; }
   export ACCESSCTL_MOCK_FAIL_AFTER=2
   run scripts/accessctl apply comfortable --operation-id 11111111-1111-4111-8111-111111111111
   [ "$status" -ne 0 ]
-  diff -u tests/fixtures/mock-values.json "$TEST_ROOT/mock/values.json"
+  diff -u <(jq -S . tests/fixtures/mock-values.json) <(jq -S . "$TEST_ROOT/mock/values.json")
   [ ! -e "$TEST_ROOT/state/omarchy-access-profiles/pending.json" ]
 }
 
