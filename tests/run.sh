@@ -85,6 +85,17 @@ test_preview_recovery() {
   cleanup_env
 }
 
+test_status_recovers_expired_preview() {
+  new_env
+  call preview comfortable --seconds 30 --operation-id 45454545-4545-4454-8454-545454545454
+  jq '.preview.deadline = 0' "$TEST_ROOT/state/omarchy-access-profiles/state.json" > "$TEST_ROOT/state/expired-status"
+  mv "$TEST_ROOT/state/expired-status" "$TEST_ROOT/state/omarchy-access-profiles/state.json"
+  call status
+  local ok=$([ "$STATUS" -eq 0 ] && jq -e '.preview == null and .activeProfile == null' <<< "$OUTPUT" >/dev/null 2>&1 && jq -e '.preview == null' "$TEST_ROOT/state/omarchy-access-profiles/state.json" >/dev/null 2>&1 && echo yes || echo no)
+  if [[ "$ok" == yes ]]; then record_pass "status recovers expired preview"; else record_fail "status recovers expired preview"; fi
+  cleanup_env
+}
+
 test_conflict_resolution() {
   new_env
   call apply comfortable --operation-id 55555555-5555-4555-8555-555555555555
@@ -146,6 +157,7 @@ test_capabilities_and_unsupported
 test_apply_restore
 test_rollback
 test_preview_recovery
+test_status_recovers_expired_preview
 test_conflict_resolution
 test_idempotency_and_diagnostics
 test_profile_validation

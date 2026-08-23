@@ -524,6 +524,27 @@ complete_restore() {
   append_history "$(jq -cn --arg op "$operation" '{at:(now|floor),operationId:$op,action:"restore",result:"ok"}')" || return 1
 }
 
+recover_expired_preview() {
+  local preview before deadline now id value
+  local -a ids=()
+  RECOVERED_PREVIEW=false
+  preview=$(jq -c '.preview // empty' <<< "$STATE_JSON")
+  [[ -n "$preview" ]] || return 0
+  deadline=$(jq -r '.deadline // 0' <<< "$preview")
+  now=$(date +%s)
+  [[ "$deadline" =~ ^[0-9]+$ && "$deadline" -le "$now" ]] || return 0
+  before=$(jq -c '.before' <<< "$preview")
+  mapfile -t ids < <(jq -r 'keys[]' <<< "$before")
+  for id in "${ids[@]}"; do
+    value=$(jq -c --arg id "$id" '.[$id]' <<< "$before")
+    apply_setting "$id" "$value" || return 1
+  done
+  STATE_JSON=$(jq -c '.activeProfile=.preview.previousActiveProfile | .lastApplied=.preview.previousLastApplied | .preview=null' <<< "$STATE_JSON")
+  save_state || return 1
+  append_history "$(jq -cn '{at:(now|floor),action:"recover-preview",result:"ok"}')" || true
+  RECOVERED_PREVIEW=true
+}
+
 cmd_capabilities() {
   local capabilities version body
   capabilities=$(capabilities_json)
@@ -537,6 +558,7 @@ cmd_list_profiles() { jq -cn --argjson profiles "$PROFILES_JSON" '{ok:true,schem
 cmd_status() {
   local caps values='{}' id value
   local -a ids=()
+  recover_expired_preview || { json_error "expired preview rollback failed" 2; return; }
   caps=$(capabilities_json)
   mapfile -t ids < <(jq -r 'keys[]' <<< "$SETTING_SPECS")
   for id in "${ids[@]}"; do
@@ -686,7 +708,7 @@ cmd_resolve_conflict() {
 }
 
 cmd_recover() {
-  local pending phase before id value preview deadline now
+  local pending phase before id value
   local -a ids=()
   if [[ -f "$PENDING_FILE" ]]; then
     pending=$(read_state_file "$PENDING_FILE" '{}') || { json_error "pending journal is malformed" 2; return; }
@@ -698,24 +720,8 @@ cmd_recover() {
     done
     clear_pending || { json_error "recovered settings but journal cleanup failed" 2; return; }
   fi
-  preview=$(jq -c '.preview // empty' <<< "$STATE_JSON")
-  if [[ -n "$preview" ]]; then
-    deadline=$(jq -r '.deadline // 0' <<< "$preview"); now=$(date +%s)
-    if [[ "$deadline" =~ ^[0-9]+$ && "$deadline" -le "$now" ]]; then
-      before=$(jq -c '.before' <<< "$preview")
-      mapfile -t ids < <(jq -r 'keys[]' <<< "$before")
-      for id in "${ids[@]}"; do
-        value=$(jq -c --arg id "$id" '.[$id]' <<< "$before")
-        apply_setting "$id" "$value" || { json_error "expired preview rollback failed" 2; return; }
-      done
-      STATE_JSON=$(jq -c '.activeProfile=.preview.previousActiveProfile | .lastApplied=.preview.previousLastApplied | .preview=null' <<< "$STATE_JSON")
-      save_state || { json_error "preview recovered but state persistence failed" 2; return; }
-      append_history "$(jq -cn '{at:(now|floor),action:"recover-preview",result:"ok"}')" || true
-      json_ok '{"recoveredPreview":true}'
-      return
-    fi
-  fi
-  json_ok '{"recovered":false}'
+  recover_expired_preview || { json_error "expired preview rollback failed" 2; return; }
+  if [[ "$RECOVERED_PREVIEW" == true ]]; then json_ok '{"recoveredPreview":true}'; else json_ok '{"recovered":false}'; fi
 }
 
 cmd_export_diagnostics() {
