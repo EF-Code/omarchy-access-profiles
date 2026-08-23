@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "profiles": [
+    {
+      "id": "comfortable",
+      "name": "Comfortable",
+      "description": "Reduce visual and input strain during long sessions.",
+      "icon": "accessibility",
+      "settings": {
+        "gtk.text.scale": 1.25,
+        "gtk.cursor.size": 36,
+        "hypr.cursor.zoom_factor": 1.15,
+        "hypr.animations.enabled": false,
+        "gtk.animations.enabled": false,
+        "input.repeat_rate": 30,
+        "input.repeat_delay": 600,
+        "hypr.border_size": 3
+      }
+    },
+    {
+      "id": "reduced-motion",
+      "name": "Reduced Motion",
+      "description": "Minimize desktop movement and visual effects.",
+      "icon": "motion-off",
+      "settings": {
+        "hypr.animations.enabled": false,
+        "gtk.animations.enabled": false,
+        "hypr.blur.enabled": false,
+        "hypr.shadow.enabled": false
+      }
+    },
+    {
+      "id": "presentation",
+      "name": "Presentation",
+      "description": "Make the pointer and active window easier to follow.",
+      "icon": "presentation",
+      "settings": {
+        "gtk.cursor.size": 44,
+        "hypr.cursor.zoom_factor": 1.2,
+        "hypr.border_size": 4,
+        "hypr.dim_inactive": true,
+        "hypr.dim_strength": 0.12
+      }
+    },
+    {
+      "id": "focus",
+      "name": "Focus",
+      "description": "Reduce decorative distraction while preserving input speed.",
+      "icon": "focus",
+      "settings": {
+        "hypr.animations.enabled": false,
+        "gtk.animations.enabled": false,
+        "hypr.blur.enabled": false,
+        "hypr.shadow.enabled": false,
+        "hypr.dim_inactive": true,
+        "hypr.dim_strength": 0.18
+      }
+    }
+  ]
+}

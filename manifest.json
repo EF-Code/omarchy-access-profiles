@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ef-code.access-profiles",
+  "name": "Access Profiles",
+  "version": "1.0.0",
+  "author": "EF-Code",
+  "license": "MIT",
+  "description": "Reversible accessibility profiles for motion, readability, cursor, and input settings.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Access Profiles",
+    "description": "Preview, apply, and restore accessibility profiles.",
+    "category": "Accessibility",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -1,0 +1,8 @@
+# The supplied implementation handoff is local-only and must never ship.
+OMARCHY_ACCESS_PROFILES_BUILD_GUIDE.md
+*_BUILD_GUIDE.md
+
+# Generated local validation output.
+.coverage/
+test-output/
+
