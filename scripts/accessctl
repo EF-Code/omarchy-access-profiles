@@ -586,7 +586,7 @@ cmd_apply() {
   operation_seen "$operation" && { json_ok "$(jq -cn --arg op "$operation" --arg profile "$profile_id" '{operationId:$op,profileId:$profile,idempotent:true}')"; return; }
   before=$(snapshot_for_profile "$profile") || { json_error "could not read current values" 2 "$(jq -cn --arg reason "${SNAPSHOT_ERROR:-$READ_ERROR}" '{reason:$reason}')"; return; }
   target=$(target_for_profile "$profile" "$before")
-  capture_baseline "$before" || { json_error "could not capture baseline" 2; return; }
+  capture_baseline || { json_error "could not capture baseline" 2; return; }
   apply_snapshot_transaction "$before" "$target" "$operation" apply "$profile_id" || { json_error "${TX_ERROR:-apply failed}" 2; return; }
   STATE_JSON=$(jq -c --arg profile "$profile_id" --arg op "$operation" --argjson applied "$TX_APPLIED" \
     --argjson target "$target" '.activeProfile=$profile | .lastApplied = $target | .preview=null | .conflicts=[] | .lastOperationId=$op' <<< "$STATE_JSON")
@@ -604,7 +604,7 @@ cmd_preview() {
   operation_seen "$operation" && { json_ok "$(jq -cn --arg op "$operation" '{operationId:$op,idempotent:true}')"; return; }
   before=$(snapshot_for_profile "$profile") || { json_error "could not read current values" 2; return; }
   target=$(target_for_profile "$profile" "$before")
-  capture_baseline "$before" || { json_error "could not capture baseline" 2; return; }
+  capture_baseline || { json_error "could not capture baseline" 2; return; }
   deadline=$(( $(date +%s) + seconds ))
   apply_snapshot_transaction "$before" "$target" "$operation" preview "$profile_id" || { json_error "${TX_ERROR:-preview failed}" 2; return; }
   STATE_JSON=$(jq -c --arg profile "$profile_id" --arg op "$operation" --argjson before "$before" --argjson target "$target" --argjson deadline "$deadline" \

@@ -65,6 +65,20 @@ test_apply_restore() {
   cleanup_env
 }
 
+test_baseline_covers_profile_switches() {
+  new_env
+  local initial
+  initial=$(jq -S -c . "$TEST_ROOT/mock/values.json")
+  call apply comfortable --operation-id 56565656-5656-4565-8565-656565656565
+  call apply focus --operation-id 57575757-5757-4575-8575-757575757575
+  call restore --operation-id 58585858-5858-4585-8585-858585858585
+  local restored
+  restored=$(jq -S -c . "$TEST_ROOT/mock/values.json")
+  local ok=$([ "$STATUS" -eq 0 ] && [ "$initial" = "$restored" ] && echo yes || echo no)
+  if [[ "$ok" == yes ]]; then record_pass "baseline restores settings introduced by later profiles"; else record_fail "baseline restores settings introduced by later profiles"; fi
+  cleanup_env
+}
+
 test_rollback() {
   new_env
   export ACCESSCTL_MOCK_FAIL_AFTER=2
@@ -155,6 +169,7 @@ test_malformed_state() {
 test_plan_read_only
 test_capabilities_and_unsupported
 test_apply_restore
+test_baseline_covers_profile_switches
 test_rollback
 test_preview_recovery
 test_status_recovers_expired_preview
