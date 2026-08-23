@@ -6,7 +6,7 @@ requires a real graphical Omarchy session or an external submission.
 ## Reproducible locally
 
 - [x] `omarchy plugin validate .`
-- [x] `qmllint -I "$OMARCHY_PATH/shell" qml/BarWidget.qml qml/Panel.qml qml/Service.qml qml/components/*.qml`
+- [x] `qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml Service.qml components/*.qml`
 - [x] `qmlformat` validation for all QML files.
 - [x] `bash tests/repository-check.sh`
 - [x] `bash tests/run.sh` — 12 tests passed.

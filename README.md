@@ -7,7 +7,8 @@ Access Profiles is a local-only Quickshell plugin for Omarchy 4.x. It groups
 carefully scoped Hyprland and GTK settings into four explainable profiles:
 Comfortable, Reduced Motion, Presentation, and Focus. Every preview and apply
 is read back, state is kept outside the checkout, and restore detects changes
-made by another tool before touching them.
+made by another tool before touching them. The repository includes the
+marketplace manifest, license, and preview asset used for publication.
 
 ![Access Profiles panel preview](assets/preview.svg)
 
@@ -25,9 +26,15 @@ Open the Access icon, select a profile, review the plan, and choose **Preview
 30s** or **Apply**. Preview has explicit **Keep** and **Revert now** actions.
 The first preview or apply captures the original baseline exactly once.
 
+The bar widget can be placed with the standard Omarchy bar command:
+
+```sh
+omarchy bar move io.github.ef-code.access-profiles --section right
+```
+
 ## Restore before removal
 
-Always choose **Restore Original** and resolve any conflicts before removing
+Always choose **Restore original settings** and resolve any conflicts before removing
 the plugin. Omarchy plugins have no uninstall hook, so removal cannot restore
 settings automatically.
 
@@ -35,10 +42,13 @@ settings automatically.
 omarchy plugin remove io.github.ef-code.access-profiles
 ```
 
-If the panel is unavailable while the checkout still exists, run:
+If the panel is unavailable while the checkout still exists, inspect the state
+and run the helper with a fresh operation ID:
 
 ```sh
-~/.config/omarchy/plugins/io.github.ef-code.access-profiles/scripts/accessctl restore
+~/.config/omarchy/plugins/io.github.ef-code.access-profiles/scripts/accessctl status
+~/.config/omarchy/plugins/io.github.ef-code.access-profiles/scripts/accessctl restore \
+  --operation-id "$(uuidgen)"
 ```
 
 The baseline is stored at
@@ -63,7 +73,8 @@ intentionally out of scope.
 ## Privacy and security
 
 The plugin has no network dependency, account, telemetry, or privileged path.
-QML invokes one local helper with the user’s permissions. Profile data can
+It runs unsandboxed inside `omarchy-shell` with the installing user’s
+permissions. QML invokes one local helper with those same permissions. Profile data can
 contain only registered setting IDs and typed bounded values; it cannot carry
 commands or configuration paths. The helper uses argument arrays, a short
 `flock`, atomic state writes, a pending-operation journal, verified rollback,
@@ -88,7 +99,8 @@ bash tests/repository-check.sh
 ```
 
 For a safe backend-only run, set `ACCESSCTL_MOCK_DIR` to an absolute temporary
-directory. The mock adapter never changes the live desktop.
+directory. The mock adapter never changes the live desktop. The test suite also
+includes a Bats file; use Bats 1.14 or newer when running `tests/accessctl.bats`.
 
 Use [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) to separate local checks from
 real graphical-session and external-submission gates.
