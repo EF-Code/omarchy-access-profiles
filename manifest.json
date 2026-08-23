@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.ef-code.access-profiles",
   "name": "Access Profiles",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "EF-Code",
   "license": "MIT",
   "description": "Reversible accessibility profiles for motion, readability, cursor, and input settings.",

@@ -1044,7 +1044,7 @@ cmd_export_diagnostics() {
   caps=$(capabilities_json)
   jq -cn --argjson caps "$caps" --arg active "$(jq -r '.activeProfile // ""' <<< "$STATE_JSON")" \
     --argjson baseline "$(jq -cn --argjson value "$([[ "$BASELINE_JSON" == null ]] && echo false || echo true)" '$value')" \
-    '{ok:true,schemaVersion:1,pluginVersion:"1.0.0",activeProfile:$active,baselineParsed:$baseline,capabilities:$caps,notes:["No usernames, home paths, window titles, command history, or application content are included."]}'
+    '{ok:true,schemaVersion:1,pluginVersion:"1.0.1",activeProfile:$active,baselineParsed:$baseline,capabilities:$caps,notes:["No usernames, home paths, window titles, command history, or application content are included."]}'
 }
 
 main() {
