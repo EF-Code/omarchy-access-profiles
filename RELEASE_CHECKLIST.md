@@ -9,7 +9,7 @@ requires a real graphical Omarchy session or an external submission.
 - [x] `qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml Service.qml components/*.qml`
 - [x] `qmlformat` validation for all QML files.
 - [x] `bash tests/repository-check.sh`
-- [x] `bash tests/run.sh` — 15 tests passed, including unmanaged-baseline, cross-profile drift, and safe-restore conflict regressions.
+- [x] `bash tests/run.sh` — 16 tests passed, including unmanaged-baseline, cross-profile drift, safe-restore conflict, and failed-baseline regressions.
 - [ ] `tests/accessctl.bats` — not rerun for the restore fix because Bats is unavailable in this environment; the portable runner passed.
 - [x] `node tests/model.test.js`
 - [x] `bash -n scripts/accessctl tests/run.sh` and `git diff --check`.
