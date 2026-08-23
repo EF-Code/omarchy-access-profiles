@@ -20,13 +20,14 @@ requires a real graphical Omarchy session or an external submission.
 
 - [x] Install from the public GitHub URL, enable the plugin, and verify the bar widget.
 - [x] Verify shell IPC summon/hide, Escape, keyboard navigation, selection, preview, and apply paths.
-- [ ] Verify pointer click and click-away paths — unverified because no usable Wayland mouse injector is available in this session.
+- [x] Verify pointer click and click-away paths — native Hyprland cursor movement plus `mouse:272` events selected Focus on `DP-2` and dismissed the panel from the other monitor.
 - [x] Preview all four profiles, wait for timeout, Keep, and Revert now.
 - [x] Apply and switch profiles, then restore the complete original baseline.
 - [x] Restart `omarchy-shell` during an active preview and verify recovery.
 - [x] Test keyboard-only flow at the live enlarged text scale (`gtk.text.scale=1.25`).
 - [x] Test narrow and vertical-bar layouts and one-monitor behavior.
-- [x] Test temporary second-output lifecycle with Hyprland `HEADLESS-1`; visual behavior on a second physical monitor remains unverified.
+- [x] Test the physical two-monitor layout: panel rendered on both `eDP-1` and `DP-2`, and cross-monitor click-away dismissal worked in both directions.
+- [x] Test reversible second-output lifecycle with Hyprland `HEADLESS-1`.
 - [x] Restore original settings and return the bar to the top position before removal.
 
 ## External submission
@@ -40,6 +41,6 @@ Do not describe the plugin as submitted until the external issue/form exists.
 ## Evidence from 2026-08-23
 
 - Public install tested from `https://github.com/EF-Code/omarchy-access-profiles.git` at `d69f3310f70faa5dc583ac46ac49eebf7a3c4d7a`; the subsequent public revisions are documentation-only.
-- Live session: Omarchy 4.0.0, Hyprland 0.56.2, Quickshell 0.3.0, Wayland, one 1920x1080 display at scale 1.25.
+- Live session: Omarchy 4.0.0, Hyprland 0.56.2, Quickshell 0.3.0, Wayland, `eDP-1` at 1920x1080 scale 1.25 plus `DP-2` at 1024x768 scale 1.
+- Native Hyprland pointer events selected a profile on `DP-2`; click-away dismissal succeeded from both monitors.
 - Reversible headless-output test created and removed `HEADLESS-1`; no persistent monitor change remained.
-- Pointer click/click-away and visual two-physical-monitor behavior are the remaining graphical-session gaps.
