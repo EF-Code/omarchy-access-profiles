@@ -49,7 +49,7 @@ Item {
     id: backendProcess
     stdout: StdioCollector { id: backendStdout; waitForEnd: true }
     stderr: StdioCollector { id: backendStderr; waitForEnd: true }
-    onExited: {
+    onExited: function(exitCode) {
       root.backendOutput = String(backendStdout.text || "")
       root.backendError = String(backendStderr.text || "")
       root.handle(root.pendingAction, root.backendOutput, exitCode)
@@ -64,7 +64,7 @@ Item {
   }
 
   IpcHandler {
-    target: "io.github.ef-code.access-profiles"
+    target: "io.github.ef-code.access-profiles.service"
     function recover() { root.run(["recover"], "recover") }
     function refresh() { root.run(["status"], "status") }
   }

@@ -58,7 +58,7 @@ BarWidget {
     function hide() { root.close() }
     function toggle() { root.toggle() }
     function refresh() { root.broadcast("refresh") }
-    function applyProfile(profileId) { root.broadcastApplyProfile(profileId) }
+    function applyProfile(profileId: string) { root.broadcastApplyProfile(profileId) }
     function restore() { root.broadcast("requestRestore") }
   }
 
