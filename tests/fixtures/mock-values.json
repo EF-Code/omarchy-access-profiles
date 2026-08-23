@@ -1,0 +1,14 @@
+{
+  "gtk.animations.enabled": true,
+  "gtk.cursor.size": 24,
+  "gtk.text.scale": 1.0,
+  "hypr.animations.enabled": true,
+  "hypr.blur.enabled": true,
+  "hypr.border_size": 2,
+  "hypr.cursor.zoom_factor": 1.0,
+  "hypr.dim_inactive": false,
+  "hypr.dim_strength": 0.2,
+  "hypr.shadow.enabled": true,
+  "input.repeat_delay": 300,
+  "input.repeat_rate": 40
+}

@@ -690,11 +690,11 @@ cmd_recover() {
       STATE_JSON=$(jq -c '.activeProfile=.preview.previousActiveProfile | .lastApplied=.preview.previousLastApplied | .preview=null' <<< "$STATE_JSON")
       save_state || { json_error "preview recovered but state persistence failed" 2; return; }
       append_history "$(jq -cn '{at:(now|floor),action:"recover-preview",result:"ok"}')" || true
-      json_ok '{recoveredPreview:true}'
+      json_ok '{"recoveredPreview":true}'
       return
     fi
   fi
-  json_ok '{recovered:false}'
+  json_ok '{"recovered":false}'
 }
 
 cmd_export_diagnostics() {
