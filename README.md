@@ -10,7 +10,7 @@ is read back, state is kept outside the checkout, and restore detects changes
 made by another tool before touching them. The repository includes the
 marketplace manifest, license, and preview asset used for publication.
 
-![Access Profiles panel preview](assets/preview.svg)
+![Access Profiles panel preview](assets/preview.png)
 
 ## Install
 
